@@ -44,8 +44,7 @@ pub fn binary_update(state: State<AppState>) -> Result<Binaries> {
 
 #[tauri::command]
 pub fn list_devices(state: State<AppState>) -> Result<Vec<Device>> {
-    let bin = state.binary.require()?;
-    adb::devices(&bin.adb)
+    adb::devices(&fleet_adb(&state)?)
 }
 
 #[tauri::command]
