@@ -5,6 +5,7 @@ use crate::apps::{self, App};
 use crate::args::ScrcpyArgs;
 use crate::control;
 use crate::emulator::{self, EmulatorInfo};
+use crate::qa::{QaConfig, QaState, Scenario};
 use crate::binary::Binaries;
 use crate::error::{AppError, Result};
 use crate::session::SessionInfo;
@@ -576,4 +577,42 @@ pub fn emu_start(state: State<AppState>, avd: String, headless: bool) -> Result<
 #[tauri::command(async)]
 pub fn emu_stop(state: State<AppState>, avd: String) -> Result<()> {
     state.emulators.stop(&fleet_adb(&state)?, &avd)
+}
+
+// ---- parallel QA ----
+
+#[tauri::command]
+pub fn qa_config_get(state: State<AppState>) -> QaConfig {
+    QaConfig::load(&state.data_dir)
+}
+
+#[tauri::command]
+pub fn qa_config_set(state: State<AppState>, config: QaConfig) -> Result<()> {
+    config.save(&state.data_dir)
+}
+
+#[tauri::command]
+pub fn qa_testsets(state: State<AppState>) -> Result<Vec<String>> {
+    QaConfig::load(&state.data_dir).testsets()
+}
+
+#[tauri::command]
+pub fn qa_submit(state: State<AppState>, scenarios: Vec<Scenario>) -> Result<String> {
+    let adb = fleet_adb(&state)?;
+    state.qa.submit(&QaConfig::load(&state.data_dir), &adb, scenarios)
+}
+
+#[tauri::command]
+pub fn qa_state(state: State<AppState>) -> QaState {
+    state.qa.state()
+}
+
+#[tauri::command]
+pub fn qa_cancel(state: State<AppState>, id: u32) -> Result<()> {
+    state.qa.cancel(id)
+}
+
+#[tauri::command]
+pub fn qa_log(state: State<AppState>, id: u32) -> Result<String> {
+    state.qa.log_tail(id, 200)
 }

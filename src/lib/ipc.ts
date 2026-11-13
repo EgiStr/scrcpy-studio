@@ -123,6 +123,52 @@ export const emuStart = (avd: string, headless: boolean) =>
   invoke<string>("emu_start", { avd, headless });
 export const emuStop = (avd: string) => invoke<void>("emu_stop", { avd });
 
+// ---- parallel QA ----
+export interface QaConfig {
+  skillDir: string;
+  python: string;
+  artifactsDir: string;
+  maxParallel: number;
+  timeoutSecs: number;
+}
+export type QaStatus =
+  | "queued"
+  | "running"
+  | "passed"
+  | "failed"
+  | "blocked"
+  | "error"
+  | "cancelled";
+export interface QaJob {
+  id: number;
+  runId: string;
+  scenario: string;
+  testset: string;
+  only?: string | null;
+  status: QaStatus;
+  serial?: string | null;
+  evidenceDir?: string | null;
+  exitCode?: number | null;
+  note?: string | null;
+  queuedAt: number;
+  startedAt?: number | null;
+  finishedAt?: number | null;
+}
+export interface QaLease {
+  serial: string;
+  jobId: number;
+  runId: string;
+  acquiredAt: number;
+}
+export const qaConfigGet = () => invoke<QaConfig>("qa_config_get");
+export const qaConfigSet = (config: QaConfig) => invoke<void>("qa_config_set", { config });
+export const qaTestsets = () => invoke<string[]>("qa_testsets");
+export const qaSubmit = (scenarios: { testset: string; only?: string }[]) =>
+  invoke<string>("qa_submit", { scenarios });
+export const qaState = () => invoke<{ jobs: QaJob[]; leases: QaLease[] }>("qa_state");
+export const qaCancel = (id: number) => invoke<void>("qa_cancel", { id });
+export const qaLog = (id: number) => invoke<string>("qa_log", { id });
+
 // ---- events ----
 export interface SessionLog {
   id: number;

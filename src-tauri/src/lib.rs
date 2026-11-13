@@ -8,6 +8,7 @@ mod control;
 mod emulator;
 mod error;
 mod profiles;
+mod qa;
 mod qr_pair;
 mod session;
 mod shortcut;
@@ -159,6 +160,13 @@ pub fn run() {
             commands::emu_list,
             commands::emu_start,
             commands::emu_stop,
+            commands::qa_config_get,
+            commands::qa_config_set,
+            commands::qa_testsets,
+            commands::qa_submit,
+            commands::qa_state,
+            commands::qa_cancel,
+            commands::qa_log,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

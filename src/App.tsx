@@ -8,6 +8,7 @@ import { ConfigurationPage } from "./pages/ConfigurationPage";
 import { ControlPage } from "./pages/ControlPage";
 import { ProfilesPage } from "./pages/ProfilesPage";
 import { EmulatorLabPage } from "./pages/EmulatorLabPage";
+import { QaRunsPage } from "./pages/QaRunsPage";
 import { useConfig } from "./state/config";
 import { binaryCurrent, profileSave } from "./lib/ipc";
 
@@ -55,6 +56,7 @@ export default function App() {
           {page === "control" && <ControlPage />}
           {page === "profiles" && <ProfilesPage />}
           {page === "emulators" && <EmulatorLabPage />}
+          {page === "qa" && <QaRunsPage />}
           {page === "shortcuts" && (
             <div className="h-full overflow-y-auto p-5">
               <ShortcutsPanel />

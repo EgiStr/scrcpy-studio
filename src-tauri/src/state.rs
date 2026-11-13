@@ -4,6 +4,7 @@ use crate::binary::{BinaryManager, BinaryProvider};
 use std::path::PathBuf;
 
 use crate::emulator::EmulatorManager;
+use crate::qa::QaEngine;
 use crate::session::SessionManager;
 
 pub struct AppState {
@@ -11,6 +12,7 @@ pub struct AppState {
     pub binary: BinaryManager,
     pub sessions: SessionManager,
     pub emulators: EmulatorManager,
+    pub qa: QaEngine,
 }
 
 impl AppState {
@@ -20,6 +22,7 @@ impl AppState {
             binary: BinaryManager::new(data_dir, make_provider()),
             sessions: SessionManager::new(),
             emulators: EmulatorManager::new(),
+            qa: QaEngine::new(),
         }
     }
 }

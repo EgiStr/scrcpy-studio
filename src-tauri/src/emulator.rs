@@ -397,7 +397,7 @@ impl EmulatorManager {
 }
 
 /// `emulator.exe` is a launcher for a qemu child, so kill the whole process tree.
-fn kill_tree(child: &mut Child) {
+pub(crate) fn kill_tree(child: &mut Child) {
     #[cfg(windows)]
     {
         let _ = Command::new("taskkill")

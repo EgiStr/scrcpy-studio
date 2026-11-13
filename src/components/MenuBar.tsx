@@ -12,6 +12,7 @@ const PAGES: { id: string; label: string }[] = [
   { id: "config", label: "Configuration" },
   { id: "control", label: "Control" },
   { id: "emulators", label: "Emulator Lab" },
+  { id: "qa", label: "QA Runs" },
 ];
 
 export function MenuBar({
