@@ -695,4 +695,56 @@ mod tests {
         let serials: std::collections::HashSet<_> = state.jobs.iter().map(|j| j.serial.clone()).collect();
         assert_eq!(serials.len(), 2, "one device per worker");
     }
+
+    /// The QA skill on whatever phones are connected (no emulators): jobs share the devices,
+    /// one at a time each. Same environment variables as the emulator test above.
+    #[test]
+    #[ignore = "runs the QA skill on the connected phones"]
+    fn skill_run_on_connected_devices() {
+        let adb = crate::emulator::locate_sdk().and_then(|s| s.adb).expect("platform-tools adb");
+        let devices = ready_devices(&adb);
+        assert!(!devices.is_empty(), "connect a phone with USB debugging on");
+        let out = std::env::temp_dir().join(format!("aqaos-phone-{}", now()));
+        let cfg = QaConfig {
+            skill_dir: std::env::var("AQAOS_SKILL_DIR").expect("AQAOS_SKILL_DIR"),
+            artifacts_dir: out.to_string_lossy().to_string(),
+            timeout_secs: 480,
+            ..QaConfig::default()
+        };
+        let testsets = cfg.testsets().unwrap();
+        let scenarios: Vec<Scenario> = std::env::var("AQAOS_E2E")
+            .expect("AQAOS_E2E")
+            .split(',')
+            .map(|item| {
+                let (file, only) = item.split_once(':').unwrap_or((item, ""));
+                let testset = testsets.iter().find(|t| t.ends_with(file)).expect("test set").clone();
+                Scenario { testset, only: Some(only.to_string()) }
+            })
+            .collect();
+
+        let engine = QaEngine::new();
+        let run = engine.submit(&cfg, &adb, scenarios).unwrap();
+        let mut peak = 0;
+        let mut state = engine.state();
+        for _ in 0..1200 {
+            state = engine.state();
+            let running: Vec<&Job> = state.jobs.iter().filter(|j| j.status == Status::Running).collect();
+            peak = peak.max(running.len());
+            let serials: std::collections::HashSet<_> = running.iter().map(|j| j.serial.clone()).collect();
+            assert_eq!(serials.len(), running.len(), "a device was given to two workers");
+            if state.jobs.iter().all(|j| j.status.is_final()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        for j in &state.jobs {
+            println!("J{} {} on {:?}: {:?} exit {:?} {:?}", j.id, j.scenario, j.serial, j.status, j.exit_code, j.note);
+            println!("  evidence: {:?}", j.evidence_dir);
+            println!("{}", engine.log_tail(j.id, 10).unwrap());
+        }
+        println!("devices {devices:?}, peak parallel {peak}");
+        println!("summary: {}", out.join(&run).join("reports").join("summary.json").display());
+        assert!(state.jobs.iter().all(|j| j.status.is_final()), "jobs finished");
+        assert!(peak <= devices.len(), "never more workers than devices");
+    }
 }
