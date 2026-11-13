@@ -15,6 +15,7 @@ import {
   type QaLease,
   type QaStatus,
 } from "../lib/ipc";
+import { useDevices } from "../state/devices";
 import { Button, PanelTitle } from "../components/ui";
 
 const BADGE: Record<QaStatus, string> = {
@@ -48,6 +49,8 @@ export function QaRunsPage() {
   const [openJob, setOpenJob] = useState<number>();
   const [log, setLog] = useState("");
   const [error, setError] = useState<string>();
+  // The dock keeps this list fresh; phones over USB or Wi-Fi and emulators all count.
+  const devices = useDevices((s) => s.devices);
 
   const loadTestsets = () =>
     qaTestsets()
@@ -155,6 +158,34 @@ export function QaRunsPage() {
       )}
 
       {error && <p className="mb-3 text-xs text-red-400">{error}</p>}
+
+      <div className="mb-4 flex flex-wrap items-center gap-2 text-xs">
+        <span className="text-zinc-500">Devices</span>
+        {devices.length === 0 && (
+          <span className="text-amber-400">
+            none connected: plug in a phone with USB debugging on, or pair one over Wi-Fi from the dock
+          </span>
+        )}
+        {devices.map((d) => {
+          const lease = leases.find((l) => l.serial === d.serial);
+          const usable = d.state === "device";
+          return (
+            <span
+              key={d.serial}
+              className={
+                "rounded border px-2 py-1 font-mono " +
+                (lease
+                  ? "border-amber-500/40 text-amber-300"
+                  : usable
+                    ? "border-emerald-500/40 text-emerald-300"
+                    : "border-red-500/40 text-red-300")
+              }
+            >
+              {d.model ?? d.serial} · {d.serial} · {lease ? `busy J${lease.jobId}` : usable ? "free" : d.state}
+            </span>
+          );
+        })}
+      </div>
 
       {testsets.length > 0 && (
         <div className="mb-5 rounded-md border border-zinc-800 bg-zinc-950 p-3">
