@@ -11,6 +11,7 @@ const PAGES: { id: string; label: string }[] = [
   { id: "profiles", label: "Profiles" },
   { id: "config", label: "Configuration" },
   { id: "control", label: "Control" },
+  { id: "emulators", label: "Emulator Lab" },
 ];
 
 export function MenuBar({

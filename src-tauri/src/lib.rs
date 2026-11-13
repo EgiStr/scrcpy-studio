@@ -5,6 +5,7 @@ mod args;
 mod binary;
 mod commands;
 mod control;
+mod emulator;
 mod error;
 mod profiles;
 mod qr_pair;
@@ -154,6 +155,10 @@ pub fn run() {
             commands::profile_load,
             commands::profile_list,
             commands::profile_delete,
+            commands::emu_sdk,
+            commands::emu_list,
+            commands::emu_start,
+            commands::emu_stop,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

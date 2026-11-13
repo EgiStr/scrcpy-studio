@@ -4,6 +4,7 @@ use crate::adb::{self, Device};
 use crate::apps::{self, App};
 use crate::args::ScrcpyArgs;
 use crate::control;
+use crate::emulator::{self, EmulatorInfo};
 use crate::binary::Binaries;
 use crate::error::{AppError, Result};
 use crate::session::SessionInfo;
@@ -533,4 +534,46 @@ mod tests {
         );
         assert_eq!(normalize_icon_url("https://example.com/x.png"), "https://example.com/x.png");
     }
+}
+
+// ---- emulator fleet ----
+
+/// The one adb every emulator operation goes through: the app's own, or the SDK's
+/// platform-tools adb when scrcpy has not been installed yet.
+fn fleet_adb(state: &AppState) -> Result<std::path::PathBuf> {
+    if let Some(bin) = state.binary.current() {
+        return Ok(bin.adb);
+    }
+    emulator::locate_sdk()
+        .and_then(|sdk| sdk.adb)
+        .ok_or_else(|| AppError::BinaryMissing("no adb: install scrcpy or Android platform-tools".into()))
+}
+
+fn require_sdk() -> Result<emulator::Sdk> {
+    emulator::locate_sdk().ok_or_else(|| {
+        AppError::NotFound("Android SDK with the emulator package (set ANDROID_HOME)".into())
+    })
+}
+
+#[tauri::command]
+pub fn emu_sdk() -> Option<emulator::Sdk> {
+    emulator::locate_sdk()
+}
+
+#[tauri::command(async)]
+pub fn emu_list(state: State<AppState>) -> Result<Vec<EmulatorInfo>> {
+    state.emulators.snapshot(&fleet_adb(&state)?)
+}
+
+#[tauri::command(async)]
+pub fn emu_start(state: State<AppState>, avd: String, headless: bool) -> Result<String> {
+    let adb = fleet_adb(&state)?;
+    adb::start_server(&adb)?;
+    let logs = state.data_dir.join("emulators");
+    state.emulators.start(&require_sdk()?, &adb, &avd, headless, &logs)
+}
+
+#[tauri::command(async)]
+pub fn emu_stop(state: State<AppState>, avd: String) -> Result<()> {
+    state.emulators.stop(&fleet_adb(&state)?, &avd)
 }

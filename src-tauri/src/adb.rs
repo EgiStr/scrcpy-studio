@@ -123,6 +123,26 @@ pub fn tcpip(adb: &Path, serial: &str, port: u16) -> Result<String> {
     Ok(run(adb, &["-s", serial, "tcpip", &port])?.trim().to_string())
 }
 
+/// `adb -s <serial> emu avd name` — the AVD an emulator instance is running.
+pub fn emu_avd_name(adb: &Path, serial: &str) -> Result<String> {
+    let out = run(adb, &["-s", serial, "emu", "avd", "name"])?;
+    match out.lines().map(str::trim).find(|l| !l.is_empty()) {
+        Some(name) if name != "OK" => Ok(name.to_string()),
+        _ => Err(AppError::Adb(format!("{serial} did not report an AVD name"))),
+    }
+}
+
+/// `adb -s <serial> emu kill` — ask an emulator to shut down cleanly.
+pub fn emu_kill(adb: &Path, serial: &str) -> Result<()> {
+    run(adb, &["-s", serial, "emu", "kill"]).map(|_| ())
+}
+
+/// True once Android has finished booting (`sys.boot_completed` is 1).
+pub fn boot_completed(adb: &Path, serial: &str) -> bool {
+    run(adb, &["-s", serial, "shell", "getprop", "sys.boot_completed"])
+        .is_ok_and(|out| out.trim() == "1")
+}
+
 /// Best-effort discovery of a device's Wi-Fi IPv4 address (queried over the current
 /// connection, typically USB). Tries `ip addr show wlan0`, then the routing table.
 pub fn device_ip(adb: &Path, serial: &str) -> Result<String> {

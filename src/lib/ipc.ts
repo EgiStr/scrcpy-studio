@@ -92,6 +92,37 @@ export const profileLoad = (name: string) => invoke<ScrcpyArgs>("profile_load", 
 export const profileList = () => invoke<string[]>("profile_list");
 export const profileDelete = (name: string) => invoke<void>("profile_delete", { name });
 
+// ---- emulator fleet ----
+export interface Sdk {
+  root: string;
+  emulator: string;
+  adb?: string | null;
+}
+export type EmulatorState =
+  | "stopped"
+  | "starting"
+  | "booting"
+  | "ready"
+  | "stopping"
+  | "offline"
+  | "failed";
+export interface EmulatorInfo {
+  name: string;
+  api?: string | null;
+  device?: string | null;
+  ram?: string | null;
+  resolution?: string | null;
+  state: EmulatorState;
+  serial?: string | null;
+  managed: boolean;
+  detail?: string | null;
+}
+export const emuSdk = () => invoke<Sdk | null>("emu_sdk");
+export const emuList = () => invoke<EmulatorInfo[]>("emu_list");
+export const emuStart = (avd: string, headless: boolean) =>
+  invoke<string>("emu_start", { avd, headless });
+export const emuStop = (avd: string) => invoke<void>("emu_stop", { avd });
+
 // ---- events ----
 export interface SessionLog {
   id: number;

@@ -3,12 +3,14 @@
 use crate::binary::{BinaryManager, BinaryProvider};
 use std::path::PathBuf;
 
+use crate::emulator::EmulatorManager;
 use crate::session::SessionManager;
 
 pub struct AppState {
     pub data_dir: PathBuf,
     pub binary: BinaryManager,
     pub sessions: SessionManager,
+    pub emulators: EmulatorManager,
 }
 
 impl AppState {
@@ -17,6 +19,7 @@ impl AppState {
             data_dir: data_dir.clone(),
             binary: BinaryManager::new(data_dir, make_provider()),
             sessions: SessionManager::new(),
+            emulators: EmulatorManager::new(),
         }
     }
 }
