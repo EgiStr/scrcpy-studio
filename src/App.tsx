@@ -1,22 +1,17 @@
 import { useEffect, useRef, useState } from "react";
 import { DeviceDock } from "./components/DeviceDock";
 import { SessionList } from "./components/SessionList";
-import { CommandBar } from "./components/CommandBar";
-import { ShortcutsPanel } from "./components/ShortcutsPanel";
-import { MenuBar } from "./components/MenuBar";
-import { ConfigurationPage } from "./pages/ConfigurationPage";
-import { ControlPage } from "./pages/ControlPage";
-import { ProfilesPage } from "./pages/ProfilesPage";
-import { EmulatorLabPage } from "./pages/EmulatorLabPage";
-import { QaRunsPage } from "./pages/QaRunsPage";
-import { AgentPage } from "./pages/AgentPage";
-import { MonitorPage } from "./pages/MonitorPage";
+import { Sidebar, type Area } from "./components/Sidebar";
+import { TestPage } from "./pages/TestPage";
+import { DevicesPage } from "./pages/DevicesPage";
+import { MirrorPage } from "./pages/MirrorPage";
+import { SettingsPage } from "./pages/SettingsPage";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { useConfig } from "./state/config";
 import { binaryCurrent, profileSave } from "./lib/ipc";
 
 export default function App() {
-  const [page, setPage] = useState("config");
+  const [area, setArea] = useState<Area>("test");
   const [hasBinary, setHasBinary] = useState(false);
 
   const args = useConfig((s) => s.args);
@@ -47,36 +42,31 @@ export default function App() {
     }, 600);
   }, [args, activeProfile]);
 
+  // The device dock and session list stay mounted everywhere (they keep the device list
+  // fresh and catch session events) but show only where they are used.
+  const showDock = area === "devices" || area === "mirror";
+
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-zinc-900 text-zinc-100">
-      <DeviceDock />
+      <Sidebar area={area} onNavigate={setArea} />
+      <div className={showDock ? "contents" : "hidden"}>
+        <DeviceDock />
+      </div>
 
       <main className="flex min-w-0 flex-1 flex-col">
-        <MenuBar page={page} onNavigate={setPage} />
-
         <div className="min-h-0 flex-1">
-          <ErrorBoundary key={page}>
-            {page === "config" && <ConfigurationPage />}
-            {page === "control" && <ControlPage />}
-            {page === "profiles" && <ProfilesPage />}
-            {page === "emulators" && <EmulatorLabPage />}
-            {page === "qa" && <QaRunsPage />}
-            {page === "agent" && (
-              <AgentPage onMonitor={() => setPage("monitor")} />
-            )}
-            {page === "monitor" && <MonitorPage />}
-            {page === "shortcuts" && (
-              <div className="h-full overflow-y-auto p-5">
-                <ShortcutsPanel />
-              </div>
-            )}
+          <ErrorBoundary key={area}>
+            {area === "test" && <TestPage onDevices={() => setArea("devices")} onSettings={() => setArea("settings")} />}
+            {area === "devices" && <DevicesPage />}
+            {area === "mirror" && <MirrorPage hasBinary={hasBinary} />}
+            {area === "settings" && <SettingsPage />}
           </ErrorBoundary>
         </div>
-
-        <CommandBar hasBinary={hasBinary} />
       </main>
 
-      <SessionList />
+      <div className={area === "mirror" ? "contents" : "hidden"}>
+        <SessionList />
+      </div>
     </div>
   );
 }

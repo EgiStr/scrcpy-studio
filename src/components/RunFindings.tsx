@@ -1,6 +1,6 @@
 // Findings of one run: each case that did not pass with its failure category, how cases
 // moved since earlier runs, a redacted report export, and AI hypotheses on request.
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { openPath } from "@tauri-apps/plugin-opener";
 import {
   errMessage,
@@ -31,14 +31,18 @@ const CHANGE_STYLE: Record<string, string> = {
   fixed: "text-emerald-300",
 };
 
-export function RunFindings({ runIds }: { runIds: string[] }) {
-  const [runId, setRunId] = useState<string>();
+/** Findings of a finished run; loaded when the run detail opens. */
+export function RunFindings({ runId }: { runId: string }) {
   const [data, setData] = useState<{ findings: Finding[]; changes: CaseChange[] }>();
   const [busy, setBusy] = useState<string>();
   const [error, setError] = useState<string>();
   const [inv, setInv] = useState<Record<string, Investigation>>({});
 
-  const current = runId ?? runIds[0];
+  useEffect(() => {
+    qaFindings(runId)
+      .then(setData)
+      .catch((e) => setError(errMessage(e)));
+  }, [runId]);
 
   async function act<T>(label: string, f: () => Promise<T>) {
     setBusy(label);
@@ -52,46 +56,40 @@ export function RunFindings({ runIds }: { runIds: string[] }) {
     }
   }
 
-  const load = (id: string) => act("load", () => qaFindings(id).then(setData));
-
   async function investigate(f: Finding) {
     const r = await act(f.id, () => qaInvestigate(f.jobId, f.caseId));
     if (r) setInv((m) => ({ ...m, [f.id]: r }));
   }
 
-  if (runIds.length === 0) return null;
   const moved = data?.changes.filter((c) => c.change === "regressed" || c.change === "fixed") ?? [];
+  const product = data?.findings.filter((f) => PRODUCT.includes(f.category)).length ?? 0;
 
   return (
-    <div className="mt-6">
-      <div className="flex flex-wrap items-center gap-2">
-        <select
-          className="rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1.5 font-mono text-xs text-zinc-100"
-          value={current}
-          onChange={(e) => {
-            setRunId(e.target.value);
-            setData(undefined);
-          }}
-        >
-          {runIds.map((r) => (
-            <option key={r}>{r}</option>
-          ))}
-        </select>
-        <Button variant="ghost" disabled={!!busy} onClick={() => load(current)}>
-          {busy === "load" ? "Loading…" : "Findings"}
-        </Button>
+    <div>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h4 className="text-sm font-medium text-zinc-200">
+          Findings
+          {data && (
+            <span className="ml-2 font-normal text-zinc-500">
+              {data.findings.length === 0
+                ? "none"
+                : `${product} product ${product === 1 ? "defect" : "defects"} · ${data.findings.length - product} other`}
+            </span>
+          )}
+        </h4>
         <Button
           variant="ghost"
           disabled={!!busy}
-          onClick={() => act("export", () => qaExport(current).then((p) => openPath(p)))}
+          onClick={() => act("export", () => qaExport(runId).then((p) => openPath(p)))}
         >
           {busy === "export" ? "Exporting…" : "Export defect report"}
         </Button>
       </div>
       {error && <p className="mt-2 text-xs text-red-400">{error}</p>}
+      {!data && !error && <p className="mt-2 text-xs text-zinc-500">Loading…</p>}
 
       {data && (
-        <div className="mt-3 flex flex-col gap-3 text-sm">
+        <div className="mt-2 flex flex-col gap-3 text-sm">
           {data.findings.length === 0 ? (
             <p className="text-xs text-emerald-300">Every graded case of this run passed.</p>
           ) : (

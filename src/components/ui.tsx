@@ -186,6 +186,37 @@ export function Grid({ children }: { children: ReactNode }) {
   return <div className="grid grid-cols-2 gap-x-4 gap-y-3">{children}</div>;
 }
 
+/** A segmented switch between the views of one area. */
+export function Tabs<T extends string>({
+  tabs,
+  value,
+  onChange,
+}: {
+  tabs: { id: T; label: ReactNode }[];
+  value: T;
+  onChange: (id: T) => void;
+}) {
+  return (
+    <div role="tablist" className="inline-flex gap-0.5 rounded-lg border border-zinc-800 bg-zinc-950 p-0.5">
+      {tabs.map((t) => (
+        <button
+          key={t.id}
+          type="button"
+          role="tab"
+          aria-selected={value === t.id}
+          onClick={() => onChange(t.id)}
+          className={
+            "rounded-md px-3 py-1 text-sm transition-colors " +
+            (value === t.id ? "bg-zinc-800 text-zinc-100 shadow-sm" : "text-zinc-400 hover:text-zinc-200")
+          }
+        >
+          {t.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 export function PanelTitle({ title, desc }: { title: string; desc?: string }) {
   return (
     <div className="mb-4">
