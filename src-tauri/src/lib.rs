@@ -1,4 +1,5 @@
 mod adb;
+mod agent;
 mod apk;
 mod apps;
 mod args;
@@ -6,6 +7,7 @@ mod binary;
 mod commands;
 mod control;
 mod emulator;
+mod monitor;
 mod error;
 mod profiles;
 mod qa;
@@ -167,6 +169,10 @@ pub fn run() {
             commands::qa_state,
             commands::qa_cancel,
             commands::qa_log,
+            commands::qa_trace,
+            commands::ai_plan,
+            commands::mon_devices,
+            commands::mon_screen,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

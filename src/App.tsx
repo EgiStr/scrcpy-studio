@@ -9,6 +9,8 @@ import { ControlPage } from "./pages/ControlPage";
 import { ProfilesPage } from "./pages/ProfilesPage";
 import { EmulatorLabPage } from "./pages/EmulatorLabPage";
 import { QaRunsPage } from "./pages/QaRunsPage";
+import { AgentPage } from "./pages/AgentPage";
+import { MonitorPage } from "./pages/MonitorPage";
 import { useConfig } from "./state/config";
 import { binaryCurrent, profileSave } from "./lib/ipc";
 
@@ -57,6 +59,8 @@ export default function App() {
           {page === "profiles" && <ProfilesPage />}
           {page === "emulators" && <EmulatorLabPage />}
           {page === "qa" && <QaRunsPage />}
+          {page === "agent" && <AgentPage onMonitor={() => setPage("monitor")} />}
+          {page === "monitor" && <MonitorPage />}
           {page === "shortcuts" && (
             <div className="h-full overflow-y-auto p-5">
               <ShortcutsPanel />

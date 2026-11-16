@@ -2,11 +2,14 @@
 //! device. A worker is the existing Telkomsel QA Skill runner (`run.py`), given an explicit
 //! serial and its own evidence directory.
 
+use crate::agent::{AgentConfig, Guard, PlanItem};
 use crate::error::{AppError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::io::{BufRead, Write};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -30,6 +33,11 @@ pub struct QaConfig {
     pub artifacts_dir: String,
     pub max_parallel: usize,
     pub timeout_secs: u64,
+    /// The model CLI (Claude Code's headless protocol) and model the AI agent uses.
+    pub ai_command: String,
+    pub ai_model: String,
+    /// Tool calls one agent job may make before it is stopped.
+    pub ai_max_actions: u32,
 }
 
 impl Default for QaConfig {
@@ -40,6 +48,9 @@ impl Default for QaConfig {
             artifacts_dir: String::new(),
             max_parallel: 2,
             timeout_secs: 3600,
+            ai_command: "claude".into(),
+            ai_model: "claude-fable-5-2".into(),
+            ai_max_actions: 80,
         }
     }
 }
@@ -71,6 +82,24 @@ impl QaConfig {
             })
     }
 
+    /// The AI agent's settings. Needs the skill checkout's `mcp/telkomsel-qa-mcp/serve.py`.
+    pub fn agent(&self) -> Result<AgentConfig> {
+        let root = self.skill_root()?;
+        let server = root
+            .ancestors()
+            .map(|d| d.join("mcp").join("telkomsel-qa-mcp").join("serve.py"))
+            .find(|p| p.is_file())
+            .ok_or_else(|| AppError::NotFound("mcp/telkomsel-qa-mcp/serve.py in the QA skill checkout".into()))?;
+        Ok(AgentConfig {
+            command: self.ai_command.clone(),
+            model: self.ai_model.clone(),
+            python: PathBuf::from(&self.python),
+            skill_root: root,
+            mcp_server: server,
+            max_actions: self.ai_max_actions.max(1),
+        })
+    }
+
     /// Test set files the skill ships, as absolute paths.
     pub fn testsets(&self) -> Result<Vec<String>> {
         let mut sets: Vec<String> = std::fs::read_dir(self.skill_root()?.join("testsets"))?
@@ -97,6 +126,7 @@ impl QaConfig {
             max_parallel: self.max_parallel.max(1),
             timeout: Duration::from_secs(self.timeout_secs),
             devices: Arc::new(move || ready_devices(&probe)),
+            agent: self.agent().ok(),
         })
     }
 }
@@ -119,6 +149,9 @@ pub struct Scenario {
     pub testset: String,
     /// Comma-separated case ids (`run.py --only`).
     pub only: Option<String>,
+    /// A goal the AI agent drives toward instead of `run.py` (the test set is then unused).
+    #[serde(default)]
+    pub goal: Option<PlanItem>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq)]
@@ -158,6 +191,11 @@ pub struct Job {
     pub scenario: String,
     pub testset: String,
     pub only: Option<String>,
+    /// "script" (`run.py`) or "agent" (the AI drives).
+    pub kind: String,
+    pub goal: Option<PlanItem>,
+    /// Tool calls the agent has made so far.
+    pub actions: u32,
     pub status: Status,
     pub serial: Option<String>,
     pub evidence_dir: Option<String>,
@@ -191,6 +229,9 @@ fn slug(text: &str) -> String {
 }
 
 fn scenario_label(s: &Scenario) -> String {
+    if let Some(g) = &s.goal {
+        return format!("goal:{}", g.id.as_deref().unwrap_or("AI"));
+    }
     let stem = Path::new(&s.testset)
         .file_stem()
         .map(|x| x.to_string_lossy().to_string())
@@ -243,13 +284,26 @@ pub struct Settings {
     pub max_parallel: usize,
     pub timeout: Duration,
     pub devices: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    /// None when the skill checkout has no MCP server: goal jobs then end as errors.
+    pub agent: Option<AgentConfig>,
+}
+
+/// What the trace reader learns about a running agent job.
+#[derive(Default)]
+struct Meter {
+    actions: AtomicU32,
+    broken: Mutex<Option<String>>,
 }
 
 #[derive(Default)]
 struct Inner {
     jobs: Vec<Job>,
     children: HashMap<u32, Child>,
+    meters: HashMap<u32, Arc<Meter>>,
     leases: HashMap<String, Lease>,
+    /// Consecutive device checks a leased serial was missing from.
+    missing: HashMap<String, u32>,
+    ticks: u64,
     settings: Option<Settings>,
     next_id: u32,
     next_run: u32,
@@ -293,6 +347,9 @@ impl QaEngine {
                 scenario: scenario_label(&s),
                 testset: s.testset,
                 only: s.only.map(|o| o.trim().to_string()).filter(|o| !o.is_empty()),
+                kind: if s.goal.is_some() { "agent" } else { "script" }.into(),
+                goal: s.goal,
+                actions: 0,
                 status: Status::Queued,
                 serial: None,
                 evidence_dir: None,
@@ -322,15 +379,25 @@ impl QaEngine {
         let status = inner.jobs.iter().find(|j| j.id == id).map(|j| j.status);
         match status {
             Some(s) if !s.is_final() => {
-                if let Some(mut child) = inner.children.remove(&id) {
-                    crate::emulator::kill_tree(&mut child);
-                }
+                kill(&mut inner, id);
                 finish(&mut inner, id, Status::Cancelled, None, Some("cancelled by user".into()));
                 Ok(())
             }
             Some(_) => Ok(()),
             None => Err(AppError::NotFound(format!("job {id}"))),
         }
+    }
+
+    /// The agent's readable trace (its calls, answers and words), newest last.
+    pub fn trace(&self, id: u32, last: usize) -> Vec<crate::agent::TraceEvent> {
+        let dir = {
+            let inner = self.inner.lock().unwrap();
+            inner.jobs.iter().find(|j| j.id == id).and_then(|j| j.evidence_dir.clone())
+        };
+        let Some(dir) = dir else { return Vec::new() };
+        let bytes = std::fs::read(Path::new(&dir).join("trace.jsonl")).unwrap_or_default();
+        let events = crate::agent::parse_trace(&String::from_utf8_lossy(&bytes));
+        events[events.len().saturating_sub(last)..].to_vec()
     }
 
     /// Last lines of a job's worker log.
@@ -355,13 +422,16 @@ impl QaEngine {
                 inner.scheduling = false;
                 return false;
             };
-            reap(&mut inner, settings.timeout);
+            reap(&mut inner, &settings);
             let queued = inner.jobs.iter().any(|j| j.status == Status::Queued);
             if !queued && inner.children.is_empty() {
                 inner.scheduling = false;
                 return false;
             }
-            (settings.clone(), queued && inner.children.len() < settings.max_parallel)
+            inner.ticks += 1;
+            // Every 5 s (10 passes), look for leased devices that went away, e.g. an unplugged cable.
+            let check_leases = !inner.leases.is_empty() && inner.ticks % 10 == 0;
+            (settings.clone(), (queued && inner.children.len() < settings.max_parallel) || check_leases)
         };
         if !wants_devices {
             return true;
@@ -369,6 +439,7 @@ impl QaEngine {
         // adb is slow: ask it outside the lock, then re-check leases under the lock.
         let ready = (settings.devices)();
         let mut inner = self.inner.lock().unwrap();
+        drop_disconnected(&mut inner, &ready);
         let queued: Vec<u32> = inner.jobs.iter().filter(|j| j.status == Status::Queued).map(|j| j.id).collect();
         let slots = settings.max_parallel.saturating_sub(inner.children.len());
         for (id, serial) in assign(&queued, &ready, &inner.leases, slots) {
@@ -378,24 +449,73 @@ impl QaEngine {
     }
 }
 
-fn reap(inner: &mut Inner, timeout: Duration) {
+fn kill(inner: &mut Inner, id: u32) {
+    if let Some(mut child) = inner.children.remove(&id) {
+        crate::emulator::kill_tree(&mut child);
+    }
+}
+
+fn reap(inner: &mut Inner, settings: &Settings) {
+    let timeout = settings.timeout;
+    let budget = settings.agent.as_ref().map_or(u32::MAX, |a| a.max_actions);
     let ids: Vec<u32> = inner.children.keys().copied().collect();
     for id in ids {
+        if let Some(meter) = inner.meters.get(&id).cloned() {
+            let actions = meter.actions.load(Ordering::Relaxed);
+            if let Some(job) = inner.jobs.iter_mut().find(|j| j.id == id) {
+                job.actions = actions;
+            }
+            let broken = meter.broken.lock().unwrap().clone();
+            if let Some(why) = broken {
+                kill(inner, id);
+                finish(inner, id, Status::Blocked, None, Some(format!("stopped: the agent tried a refused action ({why})")));
+                continue;
+            }
+            if actions > budget {
+                kill(inner, id);
+                finish(inner, id, Status::Error, None, Some(format!("stopped after {budget} actions without finishing")));
+                continue;
+            }
+        }
         let exited = inner.children.get_mut(&id).and_then(|c| c.try_wait().ok().flatten());
         if let Some(status) = exited {
             inner.children.remove(&id);
-            let dir = inner.jobs.iter().find(|j| j.id == id).and_then(|j| j.evidence_dir.clone());
-            let verdict = refine(Status::from_exit(status.code()), Path::new(&dir.unwrap_or_default()));
-            finish(inner, id, verdict, status.code(), None);
+            let job = inner.jobs.iter().find(|j| j.id == id);
+            let agent = job.is_some_and(|j| j.goal.is_some());
+            let dir = PathBuf::from(job.and_then(|j| j.evidence_dir.clone()).unwrap_or_default());
+            let (verdict, note) = if agent {
+                crate::agent::verdict(&dir)
+            } else {
+                (refine(Status::from_exit(status.code()), &dir), None)
+            };
+            finish(inner, id, verdict, status.code(), note);
             continue;
         }
         let started = inner.jobs.iter().find(|j| j.id == id).and_then(|j| j.started_at).unwrap_or(0);
         if now().saturating_sub(started) > timeout.as_secs() {
-            if let Some(mut child) = inner.children.remove(&id) {
-                crate::emulator::kill_tree(&mut child);
-            }
+            kill(inner, id);
             let note = format!("timed out after {}s", timeout.as_secs());
             finish(inner, id, Status::Error, None, Some(note));
+        }
+    }
+}
+
+/// A leased device missing from two device checks in a row (about 10 s) is gone: its job
+/// ends as an infrastructure error and the lease is released.
+fn drop_disconnected(inner: &mut Inner, ready: &[String]) {
+    let leased: Vec<(String, u32)> = inner.leases.values().map(|l| (l.serial.clone(), l.job_id)).collect();
+    inner.missing.retain(|s, _| leased.iter().any(|(l, _)| l == s));
+    for (serial, id) in leased {
+        if ready.contains(&serial) {
+            inner.missing.remove(&serial);
+            continue;
+        }
+        let n = inner.missing.entry(serial.clone()).or_insert(0);
+        *n += 1;
+        if *n >= 2 {
+            inner.missing.remove(&serial);
+            kill(inner, id);
+            finish(inner, id, Status::Error, None, Some(format!("device {serial} disconnected")));
         }
     }
 }
@@ -410,44 +530,90 @@ fn start(inner: &mut Inner, settings: &Settings, id: u32, serial: String) {
     job.status = Status::Running;
     let lease = Lease { serial: serial.clone(), job_id: id, run_id: job.run_id.clone(), acquired_at: now() };
 
+    let goal = job.goal.clone();
+    let testset = job.testset.clone();
+    let only = job.only.clone();
+    let meter = Arc::new(Meter::default());
+
     let spawned = (|| -> std::io::Result<Child> {
         std::fs::create_dir_all(&dir)?;
         let log = std::fs::File::create(dir.join("worker.log"))?;
         let r = &settings.runner;
-        let mut cmd = Command::new(&r.program);
-        cmd.args(&r.args).arg(&job.testset).arg("--out").arg(&dir).args(["-s", &serial]);
-        if let Some(only) = &job.only {
-            cmd.args(["--only", only]);
-        }
+        let state_dir = std::env::temp_dir().join("android-agent-skills").join(slug(&serial));
+        let path = r.adb_dir.as_ref().and_then(|adb_dir| {
+            let mut paths = vec![adb_dir.clone()];
+            paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+            std::env::join_paths(paths).ok()
+        });
+        let mut cmd = match &goal {
+            Some(case) => {
+                let agent = settings.agent.as_ref().ok_or_else(|| {
+                    std::io::Error::other("the AI agent is not set up (no mcp/telkomsel-qa-mcp in the QA skill folder)")
+                })?;
+                let mut cmd = crate::agent::command(agent, &serial, &dir, case, &state_dir, path.as_deref())?;
+                cmd.stdout(Stdio::piped());
+                cmd
+            }
+            None => {
+                let mut cmd = Command::new(&r.program);
+                cmd.args(&r.args).arg(&testset).arg("--out").arg(&dir).args(["-s", &serial]);
+                if let Some(only) = &only {
+                    cmd.args(["--only", only]);
+                }
+                cmd.stdout(log.try_clone()?);
+                cmd
+            }
+        };
         // ANDROID_SERIAL scopes any adb call the worker makes without -s.
         // The skill's screen-read lock lives in its state directory; one per device keeps
         // workers on different devices from waiting on each other.
         cmd.env("ANDROID_SERIAL", &serial)
-            .env("ANDROID_SKILLS_STATE", std::env::temp_dir().join("android-agent-skills").join(slug(&serial)))
+            .env("ANDROID_SKILLS_STATE", &state_dir)
             .env("PYTHONUNBUFFERED", "1")
             .env("PYTHONIOENCODING", "utf-8")
             .current_dir(&dir)
             .stdin(Stdio::null())
-            .stdout(log.try_clone()?)
             .stderr(log);
-        if let Some(adb_dir) = &r.adb_dir {
-            let mut paths = vec![adb_dir.clone()];
-            paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
-            if let Ok(joined) = std::env::join_paths(paths) {
-                cmd.env("PATH", joined);
-            }
+        if let Some(path) = &path {
+            cmd.env("PATH", path);
         }
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
-        cmd.spawn()
+        let mut child = cmd.spawn()?;
+        if let Some(out) = child.stdout.take() {
+            let trace = std::fs::File::create(dir.join("trace.jsonl"))?;
+            let guard = Guard { serial: serial.clone(), run: dir.clone() };
+            let meter = meter.clone();
+            std::thread::spawn(move || record_trace(out, trace, &guard, &meter));
+        }
+        Ok(child)
     })();
 
     match spawned {
         Ok(child) => {
             inner.leases.insert(serial, lease);
             inner.children.insert(id, child);
+            if goal.is_some() {
+                inner.meters.insert(id, meter);
+            }
         }
         Err(e) => finish(inner, id, Status::Error, None, Some(format!("could not start the worker: {e}"))),
+    }
+}
+
+/// Copy the agent's stream-json to trace.jsonl, counting tool calls and noting the first
+/// call the guard rules refuse (the scheduler then stops the job).
+fn record_trace(out: impl std::io::Read, mut trace: std::fs::File, guard: &Guard, meter: &Meter) {
+    let mut watched: HashMap<String, String> = HashMap::new();
+    for line in std::io::BufReader::new(out).lines().map_while(|l| l.ok()) {
+        let _ = writeln!(trace, "{line}");
+        let scan = guard.scan(&line);
+        meter.actions.fetch_add(scan.calls, Ordering::Relaxed);
+        watched.extend(scan.watch);
+        let slipped = scan.answers.into_iter().find_map(|(id, refused)| watched.remove(&id).filter(|_| !refused));
+        if let Some(why) = scan.stop.or(slipped) {
+            meter.broken.lock().unwrap().get_or_insert(why);
+        }
     }
 }
 
@@ -455,6 +621,7 @@ fn start(inner: &mut Inner, settings: &Settings, id: u32, serial: String) {
 /// so a crashed or killed worker can never keep its device locked.
 fn finish(inner: &mut Inner, id: u32, status: Status, code: Option<i32>, note: Option<String>) {
     inner.leases.retain(|_, l| l.job_id != id);
+    inner.meters.remove(&id);
     let Some(job) = inner.jobs.iter_mut().find(|j| j.id == id) else { return };
     job.status = status;
     job.exit_code = code;
@@ -533,7 +700,7 @@ mod tests {
 
     #[test]
     fn labels_scenarios_by_testset_and_case_filter() {
-        let s = Scenario { testset: "C:\\x\\veronika-starter.yaml".into(), only: Some(" VER-T001 ".into()) };
+        let s = Scenario { testset: "C:\\x\\veronika-starter.yaml".into(), only: Some(" VER-T001 ".into()), goal: None };
         assert_eq!(scenario_label(&s), "veronika-starter:VER-T001");
         assert_eq!(slug("veronika-starter:VER-T001"), "veronika-starter_VER-T001");
     }
@@ -548,11 +715,68 @@ mod tests {
             max_parallel,
             timeout: Duration::from_secs(timeout),
             devices: Arc::new(move || devices.clone()),
+            agent: None,
         }
     }
 
+    /// A stand-in model CLI: prints a stream-json trace for the given mode and, like the
+    /// real agent, leaves its run bundle (run.json) in its working directory.
+    const FAKE_AGENT: &str = r#"
+import json, sys, time
+mode = sys.argv[1]
+def say(o): print(json.dumps(o), flush=True)
+def call(i, name, args): say({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t%d" % i, "name": "mcp__telkomsel-qa__" + name, "input": args}]}})
+if mode in ("pass", "silent"):
+    for i in range(3):
+        call(i, "adb_screen_read", {})
+    if mode == "pass":
+        open("run.json", "w").write(json.dumps({"cases": [{"verdict": "pass"}]}))
+    say({"type": "result", "is_error": False, "result": "Reached it, it all passed.", "num_turns": 3})
+elif mode == "approve":
+    call(1, "adb_input_tap", {"target": ["Beli"], "confirm": True})
+    time.sleep(30)
+elif mode == "loop":
+    for i in range(50):
+        call(i, "adb_input_scroll", {"direction": "down"})
+    time.sleep(30)
+"#;
+
+    fn fake_agent(artifacts: &Path, devices: &[&str], max_actions: u32, mode: &str) -> (Settings, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("fake_agent.py");
+        std::fs::write(&script, FAKE_AGENT).unwrap();
+        let mut settings = fake(artifacts, devices, 1, 60);
+        settings.agent = Some(AgentConfig {
+            command: format!("python \"{}\" {mode}", script.display()),
+            model: "fake".into(),
+            python: "python".into(),
+            skill_root: tmp.path().into(),
+            mcp_server: tmp.path().join("serve.py"),
+            max_actions,
+        });
+        (settings, tmp)
+    }
+
+    fn goal() -> Scenario {
+        let case = PlanItem { kind: "goal".into(), id: Some("AI-001".into()), goal: Some("Buka Roaming".into()), ..Default::default() };
+        Scenario { testset: String::new(), only: None, goal: Some(case) }
+    }
+
+    /// Run one goal job with the fake agent in `mode`; return it and its trace.
+    fn run_agent(mode: &str) -> (Job, Vec<crate::agent::TraceEvent>, tempfile::TempDir) {
+        let out = tempfile::tempdir().unwrap();
+        let (settings, _tmp) = fake_agent(out.path(), &["p1"], 20, mode);
+        let engine = QaEngine::new();
+        engine.submit_with(settings, vec![goal()]).unwrap();
+        let state = wait_done(&engine, |_| {});
+        assert!(state.leases.is_empty());
+        let job = state.jobs[0].clone();
+        let trace = engine.trace(job.id, 50);
+        (job, trace, out)
+    }
+
     fn scenarios(codes: &[&str]) -> Vec<Scenario> {
-        codes.iter().map(|c| Scenario { testset: c.to_string(), only: None }).collect()
+        codes.iter().map(|c| Scenario { testset: c.to_string(), only: None, goal: None }).collect()
     }
 
     fn wait_done(engine: &QaEngine, mut each: impl FnMut(&QaState)) -> QaState {
@@ -622,6 +846,57 @@ mod tests {
         assert!(state.leases.is_empty());
     }
 
+    #[test]
+    fn agent_job_passes_only_on_recorded_evidence() {
+        let (job, trace, _out) = run_agent("pass");
+        assert_eq!((job.status, job.kind.as_str(), job.actions), (Status::Passed, "agent", 3));
+        assert_eq!(job.scenario, "goal:AI-001");
+        assert_eq!(trace.iter().filter(|e| e.kind == "tool").count(), 3);
+        assert_eq!(trace.last().unwrap().kind, "done");
+        let dir = Path::new(job.evidence_dir.as_ref().unwrap());
+        for f in ["plan.yaml", "mcp.json", "guard.py", "settings.json", "trace.jsonl"] {
+            assert!(dir.join(f).is_file(), "{f} is in the evidence directory");
+        }
+
+        let (job, _, _out) = run_agent("silent");
+        assert_eq!(job.status, Status::Error, "the model said it passed but recorded nothing");
+        assert!(job.note.as_deref().unwrap().contains("no evidence"));
+    }
+
+    #[test]
+    fn agent_job_is_stopped_on_a_refused_action_or_an_endless_run() {
+        let (job, _, _out) = run_agent("approve");
+        assert_eq!(job.status, Status::Blocked);
+        assert!(job.note.as_deref().unwrap().contains("refused action"));
+
+        let (job, _, _out) = run_agent("loop");
+        assert_eq!(job.status, Status::Error);
+        assert!(job.note.as_deref().unwrap().contains("20 actions"));
+    }
+
+    #[test]
+    fn an_unplugged_device_ends_its_job_and_frees_the_lease() {
+        let out = tempfile::tempdir().unwrap();
+        let attached = Arc::new(Mutex::new(vec!["usb-1".to_string()]));
+        let mut settings = fake(out.path(), &[], 1, 120);
+        let seen = attached.clone();
+        settings.devices = Arc::new(move || seen.lock().unwrap().clone());
+        settings.runner.args = vec!["-c".into(), "import time; time.sleep(60)".into()];
+        let engine = QaEngine::new();
+        engine.submit_with(settings, scenarios(&["0"])).unwrap();
+        for _ in 0..100 {
+            if engine.state().jobs[0].status == Status::Running {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        attached.lock().unwrap().clear();
+        let state = wait_done(&engine, |_| {});
+        assert_eq!(state.jobs[0].status, Status::Error);
+        assert!(state.jobs[0].note.as_deref().unwrap().contains("disconnected"));
+        assert!(state.leases.is_empty());
+    }
+
     /// Phase 2 acceptance against real emulators and the real QA skill.
     /// `AQAOS_SKILL_DIR=<telkomsel-qa-skills> AQAOS_E2E="search-playbook.yaml:SRC-T001,search-playbook.yaml:SRC-T008"
     ///  cargo test --lib parallel_skill -- --ignored --nocapture`
@@ -645,7 +920,7 @@ mod tests {
             .map(|item| {
                 let (file, only) = item.split_once(':').unwrap_or((item, ""));
                 let testset = testsets.iter().find(|t| t.ends_with(file)).expect("test set").clone();
-                Scenario { testset, only: Some(only.to_string()) }
+                Scenario { testset, only: Some(only.to_string()), goal: None }
             })
             .collect();
 
@@ -718,7 +993,7 @@ mod tests {
             .map(|item| {
                 let (file, only) = item.split_once(':').unwrap_or((item, ""));
                 let testset = testsets.iter().find(|t| t.ends_with(file)).expect("test set").clone();
-                Scenario { testset, only: Some(only.to_string()) }
+                Scenario { testset, only: Some(only.to_string()), goal: None }
             })
             .collect();
 

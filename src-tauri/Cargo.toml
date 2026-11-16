@@ -27,6 +27,7 @@ dirs = "5"
 rand = "0.8"
 mdns-sd = "0.11"
 flume = "0.11"
+base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 mslnk = "0.1"

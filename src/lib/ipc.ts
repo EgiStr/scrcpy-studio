@@ -130,6 +130,9 @@ export interface QaConfig {
   artifactsDir: string;
   maxParallel: number;
   timeoutSecs: number;
+  aiCommand: string;
+  aiModel: string;
+  aiMaxActions: number;
 }
 export type QaStatus =
   | "queued"
@@ -145,6 +148,9 @@ export interface QaJob {
   scenario: string;
   testset: string;
   only?: string | null;
+  kind: "script" | "agent";
+  goal?: PlanItem | null;
+  actions: number;
   status: QaStatus;
   serial?: string | null;
   evidenceDir?: string | null;
@@ -163,11 +169,50 @@ export interface QaLease {
 export const qaConfigGet = () => invoke<QaConfig>("qa_config_get");
 export const qaConfigSet = (config: QaConfig) => invoke<void>("qa_config_set", { config });
 export const qaTestsets = () => invoke<string[]>("qa_testsets");
-export const qaSubmit = (scenarios: { testset: string; only?: string }[]) =>
+export const qaSubmit = (scenarios: { testset: string; only?: string; goal?: PlanItem }[]) =>
   invoke<string>("qa_submit", { scenarios });
 export const qaState = () => invoke<{ jobs: QaJob[]; leases: QaLease[] }>("qa_state");
 export const qaCancel = (id: number) => invoke<void>("qa_cancel", { id });
 export const qaLog = (id: number) => invoke<string>("qa_log", { id });
+export const qaTrace = (id: number) => invoke<TraceEvent[]>("qa_trace", { id });
+
+// ---- AI agent ----
+export interface PlanItem {
+  kind: "testset" | "goal";
+  testset?: string | null;
+  only?: string | null;
+  id?: string | null;
+  topic?: string | null;
+  goal?: string | null;
+  keypoints: string[];
+  expected?: string | null;
+  why?: string | null;
+}
+export interface Plan {
+  items: PlanItem[];
+  rejected: string[];
+  costUsd?: number | null;
+}
+export interface TraceEvent {
+  kind: "say" | "tool" | "result" | "done";
+  name?: string | null;
+  detail: string;
+  error: boolean;
+}
+export const aiPlan = (objective: string) => invoke<Plan>("ai_plan", { objective });
+
+// ---- USB monitoring ----
+export interface UsbDevice {
+  serial: string;
+  state: string;
+  model?: string | null;
+  android?: string | null;
+  battery?: number | null;
+  temperatureC?: number | null;
+  foreground?: string | null;
+}
+export const monDevices = () => invoke<UsbDevice[]>("mon_devices");
+export const monScreen = (serial: string) => invoke<string>("mon_screen", { serial });
 
 // ---- events ----
 export interface SessionLog {

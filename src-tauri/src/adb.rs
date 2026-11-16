@@ -143,6 +143,23 @@ pub fn boot_completed(adb: &Path, serial: &str) -> bool {
         .is_ok_and(|out| out.trim() == "1")
 }
 
+/// Run a shell script on one device and return its output.
+pub fn shell(adb: &Path, serial: &str, script: &str) -> Result<String> {
+    run(adb, &["-s", serial, "shell", script])
+}
+
+/// The device's screen as PNG bytes.
+pub fn screencap(adb: &Path, serial: &str) -> Result<Vec<u8>> {
+    let out = command(adb)
+        .args(["-s", serial, "exec-out", "screencap", "-p"])
+        .output()
+        .map_err(|e| AppError::Adb(format!("failed to run adb: {e}")))?;
+    if !out.status.success() || out.stdout.len() < 8 {
+        return Err(AppError::Adb(String::from_utf8_lossy(&out.stderr).trim().to_string()));
+    }
+    Ok(out.stdout)
+}
+
 /// Best-effort discovery of a device's Wi-Fi IPv4 address (queried over the current
 /// connection, typically USB). Tries `ip addr show wlan0`, then the routing table.
 pub fn device_ip(adb: &Path, serial: &str) -> Result<String> {

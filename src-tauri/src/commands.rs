@@ -615,3 +615,29 @@ pub fn qa_cancel(state: State<AppState>, id: u32) -> Result<()> {
 pub fn qa_log(state: State<AppState>, id: u32) -> Result<String> {
     state.qa.log_tail(id, 200)
 }
+
+#[tauri::command]
+pub fn qa_trace(state: State<AppState>, id: u32) -> Vec<crate::agent::TraceEvent> {
+    state.qa.trace(id, 300)
+}
+
+// ---- AI agent ----
+
+/// Ask the model for a test plan from a natural-language objective. Nothing runs until
+/// the user approves the plan and submits it.
+#[tauri::command(async)]
+pub fn ai_plan(state: State<AppState>, objective: String) -> Result<crate::agent::Plan> {
+    crate::agent::plan(&QaConfig::load(&state.data_dir).agent()?, &objective)
+}
+
+// ---- USB monitoring ----
+
+#[tauri::command(async)]
+pub fn mon_devices(state: State<AppState>) -> Result<Vec<crate::monitor::UsbDevice>> {
+    crate::monitor::usb_devices(&fleet_adb(&state)?)
+}
+
+#[tauri::command(async)]
+pub fn mon_screen(state: State<AppState>, serial: String) -> Result<String> {
+    crate::monitor::screen_data_url(&fleet_adb(&state)?, &serial, 360)
+}
