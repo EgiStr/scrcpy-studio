@@ -71,16 +71,21 @@ fn rx(cell: &'static OnceLock<Regex>, pattern: &str) -> &'static Regex {
     cell.get_or_init(|| Regex::new(pattern).expect("valid pattern"))
 }
 
-/// Mask phone numbers, one-time codes and tokens before anything leaves the machine.
+/// Mask phone numbers, one-time codes, tokens and the names the assistant addresses the
+/// customer by ("Kak Budi Santoso") before anything leaves the machine. Other names are
+/// not detected.
 /// The phone pattern is the skill's own (run.py MSISDN_RE).
 pub fn redact(text: &str) -> String {
     static PHONE: OnceLock<Regex> = OnceLock::new();
     static CODE: OnceLock<Regex> = OnceLock::new();
     static BEARER: OnceLock<Regex> = OnceLock::new();
     static TOKEN: OnceLock<Regex> = OnceLock::new();
+    static NAME: OnceLock<Regex> = OnceLock::new();
     let t = rx(&PHONE, r"(?:\+?62[\s-]?|\b0)8\d{1,3}[\s-]?\d{3,4}[\s-]?\d{3,5}\b").replace_all(text, "<phone>");
     let t = rx(&CODE, r"(?i)\b(otp|kode|code|pin|password|sandi)(\W{1,12})\d{4,8}\b").replace_all(&t, "$1$2<code>");
     let t = rx(&BEARER, r"(?i)\b(bearer|token)(\s*[:=]?\s*)[A-Za-z0-9._~+/=-]{12,}").replace_all(&t, "$1$2<token>");
+    let t = rx(&NAME, r"\b(Kak|Kakak|Bapak|Ibu|Pak|Bu|Mas|Mbak|Sdr\.?|Sdri\.?)(\s+)[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}\b")
+        .replace_all(&t, "$1$2<name>");
     rx(&TOKEN, r"\b[A-Za-z0-9_-]{40,}\b").replace_all(&t, "<token>").into_owned()
 }
 
@@ -108,11 +113,31 @@ fn classify(case: &Value, run: &Value, crashed: bool) -> (Category, String) {
     if run["checks"].as_array().is_some_and(|c| c.iter().any(|c| c["ok"] == false)) {
         return (Category::BusinessRuleDefect, "a business check on the result failed".into());
     }
-    match case["surface"].as_str().unwrap_or_default() {
+    let surface = case["surface"].as_str().unwrap_or_default();
+    if matches!(surface, "veronika" | "chat") && asked_back(run["response"].as_str().unwrap_or_default()) {
+        return (
+            Category::Inconclusive,
+            "the assistant asked a follow-up question instead of answering; the case needs a follow-up turn (follows:)".into(),
+        );
+    }
+    match surface {
         "goal" => (Category::NavigationDefect, "the goal screen was not reached or lacked required content".into()),
         "veronika" | "chat" => (Category::BusinessRuleDefect, "the assistant's answer lacked required information".into()),
         _ => (Category::UiDefect, "the screen lacked required content".into()),
     }
+}
+
+/// Whether a chat reply is a clarifying question rather than an answer: it ends in quick
+/// replies (Ya / Tidak), or its only paragraph after the greeting is a question. A full
+/// answer that closes with an offer ("Vero bantu carikan ya?") is still an answer.
+fn asked_back(response: &str) -> bool {
+    let chrome = |l: &str| l == "Chat" || l.starts_with("<phone>") || l.starts_with("Hai! Vero disini");
+    let lines: Vec<&str> = response.lines().map(str::trim).filter(|l| !l.is_empty() && !chrome(l)).collect();
+    let quick = |l: &str| matches!(l.to_lowercase().as_str(), "ya" | "tidak" | "iya" | "bukan");
+    if lines.last().is_some_and(|l| quick(l)) {
+        return true;
+    }
+    lines.len() == 1 && lines[0].ends_with('?')
 }
 
 /// A job that ended without a graded case: why, from its status and note.
@@ -235,7 +260,8 @@ pub struct Change {
     pub now: String,
     pub before: Option<String>,
     pub before_run: Option<String>,
-    /// "new", "regressed", "fixed", "still failing" or "still passing".
+    /// "new", "regressed", "fixed", "still failing", "still passing" or "inconclusive"
+    /// (this run's result was an error or flaky).
     pub change: String,
 }
 
@@ -282,8 +308,14 @@ pub fn compare(run: &[Job], history: &[Job]) -> Vec<Change> {
     let mut out = Vec::new();
     for job in run {
         for (key, case_id, now) in outcomes(job) {
-            let before = past.iter().find_map(|(j, o)| o.iter().find(|(k, _, _)| *k == key).map(|(_, _, v)| (v.clone(), j.run_id.clone())));
+            // Only pass and fail are outcomes of the app; an error or flaky result says
+            // nothing about it, so it is neither compared nor compared against.
+            let graded = |v: &str| v == "pass" || v == "fail";
+            let before = past.iter().find_map(|(j, o)| {
+                o.iter().find(|(k, _, v)| *k == key && graded(v)).map(|(_, _, v)| (v.clone(), j.run_id.clone()))
+            });
             let change = match (&before, now == "pass") {
+                _ if !graded(&now) => "inconclusive",
                 (None, _) => "new",
                 (Some((b, _)), true) if b == "pass" => "still passing",
                 (Some(_), true) => "fixed",
@@ -583,9 +615,14 @@ mod tests {
             j
         };
         let case = |id: &str, v: &str| json!({"id": id, "verdict": v, "surface": "search"});
-        let old = at(0, 1, "RUN-A", json!([case("C-1", "pass"), case("C-2", "fail"), case("C-3", "fail")]));
-        let mid = at(1, 2, "RUN-B", json!([case("C-1", "pass")]));
-        let now = at(2, 5, "RUN-C", json!([case("C-1", "fail"), case("C-2", "pass"), case("C-3", "fail"), case("C-9", "fail")]));
+        let old = at(0, 1, "RUN-A", json!([case("C-1", "pass"), case("C-2", "fail"), case("C-3", "fail"), case("C-4", "pass")]));
+        let mid = at(1, 2, "RUN-B", json!([case("C-1", "pass"), case("C-3", "error")]));
+        let now = at(
+            2,
+            5,
+            "RUN-C",
+            json!([case("C-1", "fail"), case("C-2", "pass"), case("C-3", "fail"), case("C-9", "fail"), case("C-4", "error")]),
+        );
         let changes = compare(std::slice::from_ref(&now), &[old, mid, now.clone()]);
         let got: Vec<(&str, &str, Option<&str>)> =
             changes.iter().map(|c| (c.case_id.as_str(), c.change.as_str(), c.before_run.as_deref())).collect();
@@ -596,8 +633,23 @@ mod tests {
                 ("C-2", "fixed", Some("RUN-A")),
                 ("C-3", "still failing", Some("RUN-A")),
                 ("C-9", "new", None),
+                ("C-4", "inconclusive", Some("RUN-A")),
             ]
         );
+    }
+
+    #[test]
+    fn a_clarifying_question_from_the_assistant_is_not_a_defect() {
+        let quick = "Hai! Vero disini, asisten AI Telkomsel.\nApakah sudah sesuai dengan kendala yang kakak alami?\nYa\nTidak\nChat\n<phone> - Waspada penipuan";
+        let only_q = "Hai! Vero disini.\nVero bantu cek ya. Pakai nomor ini atau nomor lain?\nChat";
+        let answer = "Hai! Vero disini.\nTelkomsel punya jangkauan luas.\nPilih paket nasional.\nVero bantu carikan ya, Kak? \u{1F60A}\nChat";
+        assert!(asked_back(quick));
+        assert!(asked_back(only_q));
+        assert!(!asked_back(answer));
+        let case = json!({"verdict": "fail", "surface": "veronika"});
+        let run = |r: &str| json!({"status": "fail", "response": r, "grade": {"violations": []}});
+        assert_eq!(classify(&case, &run(quick), false).0, Category::Inconclusive);
+        assert_eq!(classify(&case, &run(answer), false).0, Category::BusinessRuleDefect);
     }
 
     #[test]
@@ -640,6 +692,7 @@ mod tests {
         assert_eq!(redact("Hubungi 081234567890 atau +62 812-3456-7890"), "Hubungi <phone> atau <phone>");
         assert_eq!(redact("kode OTP 482913 jangan dibagikan"), "kode OTP <code> jangan dibagikan");
         assert_eq!(redact("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc"), "Authorization: Bearer <token>");
+        assert_eq!(redact("Wah, Kak Budi Santoso sering pindah kota ya? Pasti seru, Kak."), "Wah, Kak <name> sering pindah kota ya? Pasti seru, Kak.");
         assert_eq!(redact("Paket 25 GB Rp320.000 7 Hari, lapor 188"), "Paket 25 GB Rp320.000 7 Hari, lapor 188", "prices and short numbers stay");
 
         let dir = tempfile::tempdir().unwrap();

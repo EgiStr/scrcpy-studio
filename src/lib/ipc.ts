@@ -225,7 +225,7 @@ export interface CaseChange {
   now: string;
   before?: string | null;
   beforeRun?: string | null;
-  change: "new" | "regressed" | "fixed" | "still failing" | "still passing";
+  change: "new" | "regressed" | "fixed" | "still failing" | "still passing" | "inconclusive";
 }
 export interface Hypothesis {
   cause: string;
