@@ -7,7 +7,7 @@ import {
   profileSave,
   errMessage,
 } from "../lib/ipc";
-import { Button, PanelTitle } from "../components/ui";
+import { Button } from "../components/ui";
 
 export function ProfilesPage() {
   const { args, setArgs, reset, activeProfile, setActiveProfile } = useConfig();
@@ -60,10 +60,9 @@ export function ProfilesPage() {
 
   return (
     <div className="mx-auto max-w-xl p-6">
-      <PanelTitle
-        title="Profiles"
-        desc="Save named configurations. Changes auto-save to the active profile."
-      />
+      <p className="mb-4 text-xs text-zinc-500">
+        Save named configurations. Changes auto-save to the active profile.
+      </p>
 
       <div className="mb-4 flex gap-2">
         <input

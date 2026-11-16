@@ -1,6 +1,7 @@
 // Test: start a run (describe it to the AI, or pick test sets) and follow every run from
 // queue to findings on one page.
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { remember, remembered } from "../lib/remember";
 import { qaState, type QaJob, type QaLease } from "../lib/ipc";
 import { useDevices } from "../state/devices";
 import { Button, Tabs } from "../components/ui";
@@ -12,7 +13,10 @@ import { RunList } from "../components/RunList";
 type Mode = "ai" | "sets";
 
 export function TestPage({ onDevices, onSettings }: { onDevices: () => void; onSettings: () => void }) {
-  const [mode, setMode] = useState<Mode>("ai");
+  const [mode, setMode] = useState<Mode>(() => remembered("test.mode", ["ai", "sets"] as Mode[], "ai"));
+  useEffect(() => {
+    remember("test.mode", mode);
+  }, [mode]);
   const [jobs, setJobs] = useState<QaJob[]>([]);
   const [leases, setLeases] = useState<QaLease[]>([]);
   const [open, setOpen] = useState<string>();

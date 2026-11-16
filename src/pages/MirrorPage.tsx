@@ -1,6 +1,7 @@
 // Mirror: everything scrcpy. Options and profiles shape the command; Apps controls the
 // phone; the command bar launches it.
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { remember, remembered } from "../lib/remember";
 import { Tabs } from "../components/ui";
 import { CommandBar } from "../components/CommandBar";
 import { ShortcutsPanel } from "../components/ShortcutsPanel";
@@ -11,7 +12,10 @@ import { ControlPage } from "./ControlPage";
 type View = "options" | "profiles" | "apps" | "shortcuts";
 
 export function MirrorPage({ hasBinary }: { hasBinary: boolean }) {
-  const [view, setView] = useState<View>("options");
+  const [view, setView] = useState<View>(() => remembered("mirror.view", ["options", "profiles", "apps", "shortcuts"] as View[], "options"));
+  useEffect(() => {
+    remember("mirror.view", view);
+  }, [view]);
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="border-b border-zinc-800 px-6 py-3">

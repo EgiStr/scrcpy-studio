@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { DeviceDock } from "./components/DeviceDock";
 import { SessionList } from "./components/SessionList";
 import { Sidebar, type Area } from "./components/Sidebar";
+import { remember, remembered } from "./lib/remember";
 import { TestPage } from "./pages/TestPage";
 import { DevicesPage } from "./pages/DevicesPage";
 import { MirrorPage } from "./pages/MirrorPage";
@@ -10,8 +11,28 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import { useConfig } from "./state/config";
 import { binaryCurrent, profileSave } from "./lib/ipc";
 
+const AREAS: Area[] = ["test", "devices", "mirror", "settings"];
+
 export default function App() {
-  const [area, setArea] = useState<Area>("test");
+  const [area, setArea] = useState<Area>(() => remembered("area", AREAS, "test"));
+
+  useEffect(() => {
+    remember("area", area);
+  }, [area]);
+
+  // Ctrl+1..4 switch areas.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
+      const i = Number(e.key) - 1;
+      if (i >= 0 && i < AREAS.length) {
+        e.preventDefault();
+        setArea(AREAS[i]);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
   const [hasBinary, setHasBinary] = useState(false);
 
   const args = useConfig((s) => s.args);
@@ -50,7 +71,7 @@ export default function App() {
     <div className="flex h-screen w-screen overflow-hidden bg-zinc-900 text-zinc-100">
       <Sidebar area={area} onNavigate={setArea} />
       <div className={showDock ? "contents" : "hidden"}>
-        <DeviceDock />
+        <DeviceDock showScrcpy={area === "mirror"} />
       </div>
 
       <main className="flex min-w-0 flex-1 flex-col">

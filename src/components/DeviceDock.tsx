@@ -14,7 +14,7 @@ import {
 import { Button, Toggle } from "./ui";
 import { BinaryManager } from "./BinaryManager";
 
-export function DeviceDock() {
+export function DeviceDock({ showScrcpy = true }: { showScrcpy?: boolean }) {
   const { devices, selected, select, refresh, loading, error } = useDevices();
   const patch = useConfig((s) => s.patch);
   const [connectAddr, setConnectAddr] = useState("");
@@ -93,7 +93,7 @@ export function DeviceDock() {
 
   return (
     <aside className="flex h-full w-72 shrink-0 flex-col gap-4 border-r border-zinc-800 bg-zinc-950 p-3 overflow-y-auto">
-      <BinaryManager />
+      {showScrcpy && <BinaryManager />}
 
       <section>
         <div className="mb-2 flex items-center justify-between">

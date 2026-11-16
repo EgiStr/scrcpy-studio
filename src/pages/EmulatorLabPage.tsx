@@ -13,7 +13,7 @@ import {
 } from "../lib/ipc";
 import { useConfig } from "../state/config";
 import { useSessions } from "../state/sessions";
-import { Button, PanelTitle } from "../components/ui";
+import { Button } from "../components/ui";
 
 const BADGE: Record<EmulatorState, string> = {
   stopped: "bg-zinc-800 text-zinc-400",
@@ -63,14 +63,11 @@ export function EmulatorLabPage() {
 
   return (
     <div className="h-full overflow-y-auto p-6">
-      <PanelTitle
-        title="Emulator Lab"
-        desc={
-          sdk === null
-            ? "Android SDK with the emulator package was not found. Install it from Android Studio or set ANDROID_HOME."
-            : `${emulators.length} AVDs · ${running} running · ${ready} ready${sdk ? ` · SDK ${sdk.root}` : ""}`
-        }
-      />
+      <p className={"mb-4 text-xs " + (sdk === null ? "text-amber-300" : "text-zinc-500")}>
+        {sdk === null
+          ? "Android SDK with the emulator package was not found. Install it from Android Studio or set ANDROID_HOME."
+          : `${emulators.length} AVDs · ${running} running · ${ready} ready${sdk ? ` · SDK ${sdk.root}` : ""}`}
+      </p>
 
       <label className="mb-4 flex items-center gap-2 text-xs text-zinc-400">
         <input type="checkbox" checked={headless} onChange={(e) => setHeadless(e.target.checked)} />
