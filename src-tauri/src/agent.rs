@@ -259,7 +259,8 @@ fn testset_json(case: &PlanItem, max_actions: u32) -> serde_json::Value {
         "source": "app",
         "method": "m2",
         "repeat": 1,
-        "max_steps": max_actions,
+        // The skill caps recorded steps at 60; the action budget is enforced separately.
+        "max_steps": max_actions.clamp(1, 60),
         "cases": [{
             "id": case.id,
             "topic": case.topic,
@@ -437,7 +438,10 @@ impl Guard {
                         serde_json::Value::String(s) => s.clone(),
                         other => other.to_string(),
                     };
-                    out.answers.push((id, c["is_error"].as_bool().unwrap_or(false) && text.contains("AQAOS guard")));
+                    // Refused, not run: by the hook, or by the CLI itself (a disallowed or
+                    // unknown tool comes back as a <tool_use_error>).
+                    let refused = text.contains("AQAOS guard") || text.contains("<tool_use_error>");
+                    out.answers.push((id, c["is_error"].as_bool().unwrap_or(false) && refused));
                 }
                 _ => {}
             }
@@ -738,6 +742,18 @@ mod tests {
         assert_eq!(lines[4].answers[0], ("t2".to_string(), true), "the hook refused it");
         let approve = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t9","name":"mcp__telkomsel-qa__adb_input_tap","input":{"target":["Beli"],"confirm":true}}]}}"#;
         assert!(g.scan(approve).stop.is_some(), "approving a risky tap stops the job at once");
+        // Seen on the real CLI: a disallowed tool is refused by the CLI, not the hook.
+        let cli = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t5","is_error":true,"content":"<tool_use_error>Error: No such tool available: Bash.</tool_use_error>"}]}}"#;
+        assert_eq!(g.scan(cli).answers[0], ("t5".to_string(), true), "the CLI refused it");
+        let ran = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t6","is_error":true,"content":"screen.py: exit 1"}]}}"#;
+        assert_eq!(g.scan(ran).answers[0], ("t6".to_string(), false), "it ran and failed: not a refusal");
+    }
+
+    #[test]
+    fn recorded_steps_stay_within_the_skill_limit() {
+        let case = PlanItem { kind: "goal".into(), id: Some("AI-001".into()), goal: Some("x".into()), ..Default::default() };
+        assert_eq!(testset_json(&case, 80)["max_steps"], 60);
+        assert_eq!(testset_json(&case, 20)["max_steps"], 20);
     }
 
     #[test]
