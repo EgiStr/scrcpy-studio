@@ -177,6 +177,9 @@ pub fn run() {
             commands::ai_plan,
             commands::qa_events,
             commands::qa_doctor,
+            commands::qa_findings,
+            commands::qa_export,
+            commands::qa_investigate,
             commands::mon_devices,
             commands::mon_screen,
         ])

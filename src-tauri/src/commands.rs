@@ -649,6 +649,63 @@ pub fn qa_doctor(state: State<AppState>) -> Vec<crate::doctor::Check> {
     crate::doctor::checks(&QaConfig::load(&state.data_dir), adb.as_deref())
 }
 
+#[derive(serde::Serialize)]
+pub struct RunFindings {
+    findings: Vec<crate::defects::Finding>,
+    changes: Vec<crate::defects::Change>,
+}
+
+fn run_jobs(state: &AppState, run_id: &str) -> Result<(Vec<crate::qa::Job>, Vec<crate::qa::Job>)> {
+    let all = state.qa.state().jobs;
+    let run: Vec<crate::qa::Job> = all.iter().filter(|j| j.run_id == run_id).cloned().collect();
+    if run.is_empty() {
+        return Err(AppError::InvalidArgs(format!("no run {run_id}")));
+    }
+    Ok((run, all))
+}
+
+/// Every non-passing case of a run, classified, and how each case moved since earlier runs.
+#[tauri::command(async)]
+pub fn qa_findings(state: State<AppState>, run_id: String) -> Result<RunFindings> {
+    let (run, all) = run_jobs(&state, &run_id)?;
+    Ok(RunFindings { findings: run.iter().flat_map(crate::defects::findings).collect(), changes: crate::defects::compare(&run, &all) })
+}
+
+/// Write the run's redacted defect report; returns the path of findings.md.
+#[tauri::command(async)]
+pub fn qa_export(state: State<AppState>, run_id: String) -> Result<String> {
+    let (run, all) = run_jobs(&state, &run_id)?;
+    let cfg = QaConfig::load(&state.data_dir);
+    let path = crate::defects::export(std::path::Path::new(&cfg.artifacts_dir), &run_id, &run, &all)
+        .map_err(|e| AppError::Io(format!("defect report: {e}")))?;
+    state.qa.audit("export", Some(&run_id), &path.to_string_lossy());
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Ask the AI for hypotheses about why one case did not pass. Read-only; never changes the verdict.
+#[tauri::command(async)]
+pub fn qa_investigate(state: State<AppState>, job_id: u32, case_id: String) -> Result<crate::defects::Investigation> {
+    let job = state
+        .qa
+        .state()
+        .jobs
+        .into_iter()
+        .find(|j| j.id == job_id)
+        .ok_or_else(|| AppError::InvalidArgs(format!("no job J{job_id}")))?;
+    let finding = crate::defects::findings(&job)
+        .into_iter()
+        .find(|f| f.case_id == case_id)
+        .ok_or_else(|| AppError::InvalidArgs(format!("J{job_id} has no finding for {case_id}")))?;
+    let agent = QaConfig::load(&state.data_dir).agent()?;
+    let result = crate::defects::investigate(&agent, &finding);
+    let detail = match &result {
+        Ok(inv) => serde_json::json!({"finding": finding.id, "model": inv.model, "costUsd": inv.cost_usd, "hypotheses": inv.hypotheses.len()}),
+        Err(e) => serde_json::json!({"finding": finding.id, "error": e.to_string()}),
+    };
+    state.qa.audit("investigate", Some(&job.run_id), &detail.to_string());
+    result
+}
+
 /// The audit log, newest first.
 #[tauri::command]
 pub fn qa_events(state: State<AppState>) -> Vec<crate::store::Event> {

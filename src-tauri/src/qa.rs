@@ -703,6 +703,8 @@ fn finish(inner: &mut Inner, id: u32, status: Status, code: Option<i32>, note: O
     if run.iter().all(|j| j.status.is_final()) {
         if let Some(settings) = &inner.settings {
             let _ = write_summary(&settings.artifacts, &run_id, &run);
+            let run: Vec<Job> = run.into_iter().cloned().collect();
+            let _ = crate::defects::export(&settings.artifacts, &run_id, &run, &inner.jobs);
         }
     }
 }

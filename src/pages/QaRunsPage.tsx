@@ -20,6 +20,7 @@ import {
 import { useDevices } from "../state/devices";
 import { Button, PanelTitle } from "../components/ui";
 import { SetupCheck } from "../components/SetupCheck";
+import { RunFindings } from "../components/RunFindings";
 
 const BADGE: Record<QaStatus, string> = {
   queued: "bg-zinc-800 text-zinc-400",
@@ -289,6 +290,8 @@ export function QaRunsPage() {
           {log || "(no output yet)"}
         </pre>
       )}
+
+      <RunFindings runIds={[...new Set([...jobs].reverse().map((j) => j.runId))]} />
 
       <div className="mt-6">
         <Button

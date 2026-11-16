@@ -189,6 +189,65 @@ export interface SetupCheck {
 }
 export const qaDoctor = () => invoke<SetupCheck[]>("qa_doctor");
 export const qaEvents = () => invoke<AuditEvent[]>("qa_events");
+
+export type DefectCategory =
+  | "ui-defect"
+  | "navigation-defect"
+  | "business-rule-defect"
+  | "app-crash"
+  | "automation-error"
+  | "infrastructure-issue"
+  | "inconclusive";
+export interface Finding {
+  id: string;
+  runId: string;
+  jobId: number;
+  scenario: string;
+  caseId: string;
+  verdict: string;
+  category: DefectCategory;
+  reason: string;
+  summary: string;
+  expected: string[];
+  actual: string;
+  missed: string[];
+  steps: string[];
+  evidence: string[];
+  evidenceDir?: string | null;
+  serial?: string | null;
+  device: string;
+  appVersion: string;
+}
+export interface CaseChange {
+  jobId: number;
+  caseId: string;
+  key: string;
+  now: string;
+  before?: string | null;
+  beforeRun?: string | null;
+  change: "new" | "regressed" | "fixed" | "still failing" | "still passing";
+}
+export interface Hypothesis {
+  cause: string;
+  confidence: number;
+  supporting: string[];
+  against: string[];
+}
+export interface Investigation {
+  findingId: string;
+  hypotheses: Hypothesis[];
+  limitations: string[];
+  nextSteps: string[];
+  model: string;
+  costUsd?: number | null;
+  at: number;
+  note: string;
+}
+export const qaFindings = (runId: string) =>
+  invoke<{ findings: Finding[]; changes: CaseChange[] }>("qa_findings", { runId });
+export const qaExport = (runId: string) => invoke<string>("qa_export", { runId });
+export const qaInvestigate = (jobId: number, caseId: string) =>
+  invoke<Investigation>("qa_investigate", { jobId, caseId });
 export const qaTrace = (id: number) => invoke<TraceEvent[]>("qa_trace", { id });
 
 // ---- AI agent ----

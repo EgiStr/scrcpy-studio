@@ -378,6 +378,120 @@ pub fn export(artifacts: &Path, run_id: &str, jobs: &[Job], history: &[Job]) -> 
     Ok(md)
 }
 
+// ---- AI investigator ----
+
+/// One possible cause, as the model sees it. A hypothesis, never a verdict.
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Hypothesis {
+    pub cause: String,
+    /// 0 to 1.
+    pub confidence: f64,
+    pub supporting: Vec<String>,
+    pub against: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Investigation {
+    pub finding_id: String,
+    pub hypotheses: Vec<Hypothesis>,
+    pub limitations: Vec<String>,
+    pub next_steps: Vec<String>,
+    pub model: String,
+    pub cost_usd: Option<f64>,
+    pub at: u64,
+    pub note: String,
+}
+
+const INVESTIGATION_NOTE: &str =
+    "AI hypotheses about the cause, read from the evidence. They are not a confirmed root cause and do not change the verdict.";
+
+fn investigate_prompt(f: &Finding) -> String {
+    let finding = redact(&serde_json::to_string_pretty(f).unwrap_or_default());
+    format!(
+        r#"A MyTelkomsel QA case did not pass. Find out why. The current directory is its evidence: run.json (the graded result), logs/, screenshots and step records. Read what you need (Glob, Grep, Read).
+
+The finding, already classified by fixed rules:
+{finding}
+
+Give at most 3 hypotheses about the cause, most likely first. Each cites the evidence files and lines that support it and those that argue against it. Say whether the cause looks like the app, the test case (wrong expectation), the automation, or the device. Do not guess beyond the evidence; if it is thin, say so in limitations.
+
+Answer with one JSON object and nothing else:
+{{"hypotheses":[{{"cause":"<one sentence>","confidence":0.0,"supporting":["<file: what it shows>"],"against":["<file: what it shows>"]}}],
+"limitations":["<what the evidence cannot tell>"],
+"nextSteps":["<what a tester should check or rerun>"]}}"#
+    )
+}
+
+/// The model's reply as an investigation: confidences kept in 0..1, most likely first.
+fn parse_investigation(text: &str) -> Option<(Vec<Hypothesis>, Vec<String>, Vec<String>)> {
+    let raw = crate::agent::extract_json(text)?;
+    let mut hyps: Vec<Hypothesis> = serde_json::from_value(raw["hypotheses"].clone()).ok()?;
+    hyps.retain(|h| !h.cause.trim().is_empty());
+    for h in hyps.iter_mut() {
+        h.confidence = if h.confidence.is_finite() { h.confidence.clamp(0.0, 1.0) } else { 0.0 };
+    }
+    hyps.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+    hyps.truncate(3);
+    let list = |k: &str| -> Vec<String> {
+        raw[k].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)).collect()
+    };
+    Some((hyps, list("limitations"), list("nextSteps")))
+}
+
+/// Ask the model for hypotheses. Read-only, inside the evidence directory only. The result
+/// is saved next to the evidence as investigation-<case>.json.
+pub fn investigate(cfg: &crate::agent::AgentConfig, f: &Finding) -> crate::error::Result<Investigation> {
+    use crate::error::AppError;
+    let dir = f
+        .evidence_dir
+        .as_deref()
+        .filter(|d| Path::new(d).is_dir())
+        .ok_or_else(|| AppError::NotFound(format!("evidence for {}", f.id)))?;
+    let mut cmd = crate::agent::base_command(&cfg.command);
+    cmd.arg("-p")
+        .arg(investigate_prompt(f))
+        .args(["--model", &cfg.model, "--output-format", "json"])
+        .args(["--allowedTools", "Read,Glob,Grep"])
+        .args(["--disallowedTools", "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch"])
+        .args(["--strict-mcp-config", "--setting-sources", ""])
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let out = cmd.output().map_err(|e| AppError::NotFound(format!("the AI command \"{}\" ({e})", cfg.command)))?;
+    let reply: Value = serde_json::from_slice(&out.stdout).map_err(|_| {
+        AppError::Io(format!(
+            "the AI command gave no JSON (exit {:?}): {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    })?;
+    let text = reply["result"].as_str().unwrap_or_default();
+    if reply["is_error"].as_bool().unwrap_or(false) {
+        return Err(AppError::Io(format!("the AI could not investigate: {text}")));
+    }
+    let (hypotheses, limitations, next_steps) = parse_investigation(text)
+        .ok_or_else(|| AppError::Io(format!("the investigation is not in the expected JSON: {text}")))?;
+    let inv = Investigation {
+        finding_id: f.id.clone(),
+        hypotheses,
+        limitations,
+        next_steps,
+        model: cfg.model.clone(),
+        cost_usd: reply["total_cost_usd"].as_f64(),
+        at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+        note: INVESTIGATION_NOTE.into(),
+    };
+    let file = Path::new(dir).join(format!("investigation-{}.json", f.case_id.replace(['/', '\\', ':'], "_")));
+    let _ = std::fs::write(file, redact(&serde_json::to_string_pretty(&inv).unwrap_or_default()));
+    Ok(inv)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,6 +608,31 @@ mod tests {
         assert_eq!(case_key(&j, &goal("AI-001")), case_key(&j, &goal("AI-004")));
         let other = json!({"id": "AI-001", "surface": "goal", "goal": "Buka menu Kuota", "expected_keypoints": ["re:Rp :: harga"]});
         assert_ne!(case_key(&j, &goal("AI-001")), case_key(&j, &other));
+    }
+
+    #[test]
+    fn an_investigation_keeps_confidence_in_range_and_most_likely_first() {
+        let reply = r#"Here is what I found:
+{"hypotheses":[
+ {"cause":"The keypoint regex expects Rp but the screen shows IDR","confidence":0.4,"supporting":["run.json: response says IDR"]},
+ {"cause":"Veronika answered about a different package","confidence":1.7,"supporting":["logs/C-1.log:12"],"against":[]},
+ {"cause":"","confidence":0.9},
+ {"cause":"Slow network","confidence":-2},
+ {"cause":"Extra","confidence":0.1}],
+ "limitations":["no screenshot of the final answer"],"nextSteps":["rerun C-1"]}"#;
+        let (h, lim, next) = parse_investigation(reply).unwrap();
+        let got: Vec<(&str, f64)> = h.iter().map(|h| (h.cause.as_str(), h.confidence)).collect();
+        assert_eq!(
+            got,
+            [
+                ("Veronika answered about a different package", 1.0),
+                ("The keypoint regex expects Rp but the screen shows IDR", 0.4),
+                ("Extra", 0.1)
+            ]
+        );
+        assert_eq!(lim, ["no screenshot of the final answer"]);
+        assert_eq!(next, ["rerun C-1"]);
+        assert!(parse_investigation("I could not tell.").is_none());
     }
 
     #[test]
