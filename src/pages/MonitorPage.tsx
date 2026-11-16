@@ -15,7 +15,7 @@ import {
 } from "../lib/ipc";
 import { useConfig } from "../state/config";
 import { useSessions } from "../state/sessions";
-import { Button, PanelTitle } from "../components/ui";
+import { Button } from "../components/ui";
 import { JobFeed, StatusBadge, since, usePoll } from "../components/qa";
 
 function DeviceCard({
@@ -164,10 +164,9 @@ export function MonitorPage() {
 
   return (
     <div className="h-full overflow-y-auto p-6">
-      <PanelTitle
-        title="Phones"
-        desc={`${devices?.length ?? 0} phones on USB · ${running} jobs running · ${queued} waiting for a phone`}
-      />
+      <p className="mb-4 text-xs text-zinc-500">
+        {`${devices?.length ?? 0} phones on USB · ${running} jobs running · ${queued} waiting for a phone`}
+      </p>
       <label className="mb-4 flex items-center gap-2 text-xs text-zinc-400">
         <input type="checkbox" checked={liveScreen} onChange={(e) => setLiveScreen(e.target.checked)} />
         Live screen (a screenshot every few seconds; use Mirror for full video)
