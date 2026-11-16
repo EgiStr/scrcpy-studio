@@ -15,6 +15,8 @@ mod qr_pair;
 mod session;
 mod shortcut;
 mod state;
+mod store;
+mod workers;
 
 use state::AppState;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
@@ -171,6 +173,7 @@ pub fn run() {
             commands::qa_log,
             commands::qa_trace,
             commands::ai_plan,
+            commands::qa_events,
             commands::mon_devices,
             commands::mon_screen,
         ])

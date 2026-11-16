@@ -587,7 +587,9 @@ pub fn qa_config_get(state: State<AppState>) -> QaConfig {
 
 #[tauri::command]
 pub fn qa_config_set(state: State<AppState>, config: QaConfig) -> Result<()> {
-    config.save(&state.data_dir)
+    config.save(&state.data_dir)?;
+    state.qa.audit("config", None, &serde_json::to_string(&config).unwrap_or_default());
+    Ok(())
 }
 
 #[tauri::command]
@@ -627,7 +629,23 @@ pub fn qa_trace(state: State<AppState>, id: u32) -> Vec<crate::agent::TraceEvent
 /// the user approves the plan and submits it.
 #[tauri::command(async)]
 pub fn ai_plan(state: State<AppState>, objective: String) -> Result<crate::agent::Plan> {
-    crate::agent::plan(&QaConfig::load(&state.data_dir).agent()?, &objective)
+    let cfg = QaConfig::load(&state.data_dir).agent()?;
+    let plan = crate::agent::plan(&cfg, &objective)?;
+    let detail = serde_json::json!({
+        "objective": objective,
+        "model": cfg.model,
+        "costUsd": plan.cost_usd,
+        "items": plan.items.iter().map(|i| i.id.clone().or(i.only.clone()).unwrap_or_default()).collect::<Vec<_>>(),
+        "rejected": plan.rejected,
+    });
+    state.qa.audit("plan", None, &detail.to_string());
+    Ok(plan)
+}
+
+/// The audit log, newest first.
+#[tauri::command]
+pub fn qa_events(state: State<AppState>) -> Vec<crate::store::Event> {
+    state.qa.events(300)
 }
 
 // ---- USB monitoring ----

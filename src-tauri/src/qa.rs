@@ -4,6 +4,7 @@
 
 use crate::agent::{AgentConfig, Guard, PlanItem};
 use crate::error::{AppError, Result};
+use crate::store::Store;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -154,7 +155,7 @@ pub struct Scenario {
     pub goal: Option<PlanItem>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     Queued,
@@ -167,6 +168,18 @@ pub enum Status {
 }
 
 impl Status {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Status::Queued => "queued",
+            Status::Running => "running",
+            Status::Passed => "passed",
+            Status::Failed => "failed",
+            Status::Blocked => "blocked",
+            Status::Error => "error",
+            Status::Cancelled => "cancelled",
+        }
+    }
+
     fn is_final(self) -> bool {
         !matches!(self, Status::Queued | Status::Running)
     }
@@ -183,7 +196,7 @@ impl Status {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Job {
     pub id: u32,
@@ -305,6 +318,8 @@ struct Inner {
     missing: HashMap<String, u32>,
     ticks: u64,
     settings: Option<Settings>,
+    /// Run history and audit log; None in tests that do not need them.
+    store: Option<Store>,
     next_id: u32,
     next_run: u32,
     scheduling: bool,
@@ -318,6 +333,41 @@ pub struct QaEngine {
 impl QaEngine {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An engine that keeps its jobs in `store`. Jobs a previous app session left queued
+    /// or running get a final state: their workers died with that session.
+    pub fn with_store(store: Store) -> Self {
+        let mut jobs = store.jobs(500).unwrap_or_default();
+        for job in jobs.iter_mut().filter(|j| !j.status.is_final()) {
+            let (status, note) = if job.status == Status::Running {
+                (Status::Error, "interrupted: the app closed while this job ran")
+            } else {
+                (Status::Cancelled, "the app closed before this job started")
+            };
+            job.status = status;
+            job.note = Some(note.into());
+            job.finished_at = Some(now());
+            let _ = store.save_job(job);
+            let _ = store.event(now(), "interrupted", Some(job.id), Some(&job.run_id), note);
+        }
+        let next_id = store.max_job_id().unwrap_or(0);
+        let inner = Inner { jobs, store: Some(store), next_id, ..Default::default() };
+        Self { inner: Arc::new(Mutex::new(inner)) }
+    }
+
+    /// Record a user or AI action in the audit log.
+    pub fn audit(&self, kind: &str, run_id: Option<&str>, detail: &str) {
+        let inner = self.inner.lock().unwrap();
+        if let Some(store) = &inner.store {
+            let _ = store.event(now(), kind, None, run_id, detail);
+        }
+    }
+
+    /// The newest audit-log entries, newest first.
+    pub fn events(&self, limit: u32) -> Vec<crate::store::Event> {
+        let inner = self.inner.lock().unwrap();
+        inner.store.as_ref().and_then(|s| s.events(limit).ok()).unwrap_or_default()
     }
 
     pub fn state(&self) -> QaState {
@@ -359,8 +409,11 @@ impl QaEngine {
                 started_at: None,
                 finished_at: None,
             };
+            persist(&inner, &job);
             inner.jobs.push(job);
         }
+        let labels: Vec<String> = inner.jobs.iter().filter(|j| j.run_id == run_id).map(|j| format!("J{} {}", j.id, j.scenario)).collect();
+        audit(&inner, "submit", None, Some(&run_id), &labels.join(", "));
         inner.settings = Some(settings);
         if !inner.scheduling {
             inner.scheduling = true;
@@ -379,6 +432,7 @@ impl QaEngine {
         let status = inner.jobs.iter().find(|j| j.id == id).map(|j| j.status);
         match status {
             Some(s) if !s.is_final() => {
+                audit(&inner, "cancel", Some(id), None, "cancelled by user");
                 kill(&mut inner, id);
                 finish(&mut inner, id, Status::Cancelled, None, Some("cancelled by user".into()));
                 Ok(())
@@ -580,6 +634,10 @@ fn start(inner: &mut Inner, settings: &Settings, id: u32, serial: String) {
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
         let mut child = cmd.spawn()?;
+        if !crate::workers::adopt(&child) {
+            crate::emulator::kill_tree(&mut child);
+            return Err(std::io::Error::other("could not tie the worker to the app, so it could outlive it"));
+        }
         if let Some(out) = child.stdout.take() {
             let trace = std::fs::File::create(dir.join("trace.jsonl"))?;
             let guard = Guard { serial: serial.clone(), run: dir.clone() };
@@ -591,6 +649,10 @@ fn start(inner: &mut Inner, settings: &Settings, id: u32, serial: String) {
 
     match spawned {
         Ok(child) => {
+            if let Some(job) = inner.jobs.iter().find(|j| j.id == id) {
+                persist(inner, job);
+                audit(inner, "start", Some(id), Some(&job.run_id), &format!("on {serial}"));
+            }
             inner.leases.insert(serial, lease);
             inner.children.insert(id, child);
             if goal.is_some() {
@@ -628,12 +690,28 @@ fn finish(inner: &mut Inner, id: u32, status: Status, code: Option<i32>, note: O
     job.note = note;
     job.finished_at = Some(now());
     let run_id = job.run_id.clone();
+    let detail = format!("{}{}", job.status.as_str(), job.note.as_deref().map(|n| format!(": {n}")).unwrap_or_default());
+    let job = job.clone();
+    persist(inner, &job);
+    audit(inner, "finish", Some(id), Some(&run_id), &detail);
 
     let run: Vec<&Job> = inner.jobs.iter().filter(|j| j.run_id == run_id).collect();
     if run.iter().all(|j| j.status.is_final()) {
         if let Some(settings) = &inner.settings {
             let _ = write_summary(&settings.artifacts, &run_id, &run);
         }
+    }
+}
+
+fn persist(inner: &Inner, job: &Job) {
+    if let Some(store) = &inner.store {
+        let _ = store.save_job(job);
+    }
+}
+
+fn audit(inner: &Inner, kind: &str, job_id: Option<u32>, run_id: Option<&str>, detail: &str) {
+    if let Some(store) = &inner.store {
+        let _ = store.event(now(), kind, job_id, run_id, detail);
     }
 }
 
@@ -872,6 +950,43 @@ elif mode == "loop":
         let (job, _, _out) = run_agent("loop");
         assert_eq!(job.status, Status::Error);
         assert!(job.note.as_deref().unwrap().contains("20 actions"));
+    }
+
+    #[test]
+    fn history_survives_a_restart_and_interrupted_jobs_get_a_final_state() {
+        let out = tempfile::tempdir().unwrap();
+        let db = out.path().join("history.db");
+        let first = QaEngine::with_store(Store::open(&db).unwrap());
+        first.submit_with(fake(out.path(), &["d1"], 1, 60), scenarios(&["0"])).unwrap();
+        wait_done(&first, |_| {});
+
+        let mut slow = fake(out.path(), &["d1"], 1, 120);
+        slow.runner.args = vec!["-c".into(), "import time; time.sleep(60)".into()];
+        first.submit_with(slow, scenarios(&["slow", "waiting"])).unwrap();
+        for _ in 0..100 {
+            if first.state().jobs[1].status == Status::Running {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // The app restarts while job 2 runs and job 3 waits for the only device.
+        let second = QaEngine::with_store(Store::open(&db).unwrap());
+        let jobs = second.state().jobs;
+        assert_eq!(jobs.iter().map(|j| j.status).collect::<Vec<_>>(), vec![Status::Passed, Status::Error, Status::Cancelled]);
+        assert!(jobs[1].note.as_deref().unwrap().contains("interrupted"));
+        assert!(jobs[1].evidence_dir.is_some(), "its evidence is still referenced");
+        let kinds: Vec<String> = second.events(50).into_iter().map(|e| e.kind).collect();
+        for k in ["submit", "start", "finish", "interrupted"] {
+            assert!(kinds.iter().any(|x| x == k), "{k} is in the audit log: {kinds:?}");
+        }
+
+        let run = second.submit_with(fake(out.path(), &["d1"], 1, 60), scenarios(&["0"])).unwrap();
+        let state = second.state();
+        assert_eq!(state.jobs.last().unwrap().id, 4, "ids continue after a restart");
+        assert_eq!(state.jobs.last().unwrap().run_id, run);
+        first.cancel(2).unwrap();
+        wait_done(&second, |_| {});
     }
 
     #[test]

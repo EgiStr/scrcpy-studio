@@ -174,6 +174,14 @@ export const qaSubmit = (scenarios: { testset: string; only?: string; goal?: Pla
 export const qaState = () => invoke<{ jobs: QaJob[]; leases: QaLease[] }>("qa_state");
 export const qaCancel = (id: number) => invoke<void>("qa_cancel", { id });
 export const qaLog = (id: number) => invoke<string>("qa_log", { id });
+export interface AuditEvent {
+  at: number;
+  kind: string;
+  jobId?: number | null;
+  runId?: string | null;
+  detail: string;
+}
+export const qaEvents = () => invoke<AuditEvent[]>("qa_events");
 export const qaTrace = (id: number) => invoke<TraceEvent[]>("qa_trace", { id });
 
 // ---- AI agent ----

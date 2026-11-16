@@ -19,10 +19,16 @@ impl AppState {
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
             data_dir: data_dir.clone(),
-            binary: BinaryManager::new(data_dir, make_provider()),
+            binary: BinaryManager::new(data_dir.clone(), make_provider()),
             sessions: SessionManager::new(),
             emulators: EmulatorManager::new(),
-            qa: QaEngine::new(),
+            qa: match crate::store::Store::open(&data_dir.join("history.db")) {
+                Ok(store) => QaEngine::with_store(store),
+                Err(e) => {
+                    eprintln!("run history disabled: {e}");
+                    QaEngine::new()
+                }
+            },
         }
     }
 }

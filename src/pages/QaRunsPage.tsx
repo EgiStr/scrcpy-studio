@@ -6,10 +6,12 @@ import {
   qaCancel,
   qaConfigGet,
   qaConfigSet,
+  qaEvents,
   qaLog,
   qaState,
   qaSubmit,
   qaTestsets,
+  type AuditEvent,
   type QaConfig,
   type QaJob,
   type QaLease,
@@ -49,6 +51,7 @@ export function QaRunsPage() {
   const [openJob, setOpenJob] = useState<number>();
   const [log, setLog] = useState("");
   const [error, setError] = useState<string>();
+  const [audit, setAudit] = useState<AuditEvent[]>();
   // The dock keeps this list fresh; phones over USB or Wi-Fi and emulators all count.
   const devices = useDevices((s) => s.devices);
 
@@ -283,6 +286,31 @@ export function QaRunsPage() {
           {log || "(no output yet)"}
         </pre>
       )}
+
+      <div className="mt-6">
+        <Button
+          variant="ghost"
+          onClick={() =>
+            audit ? setAudit(undefined) : qaEvents().then(setAudit).catch((e) => setError(errMessage(e)))
+          }
+        >
+          {audit ? "Hide audit log" : "Audit log"}
+        </Button>
+        {audit && (
+          <table className="mt-2 w-full text-left font-mono text-xs text-zinc-400">
+            <tbody>
+              {audit.map((e, i) => (
+                <tr key={i} className="border-t border-zinc-800 align-top">
+                  <td className="whitespace-nowrap py-1 pr-3">{new Date(e.at * 1000).toLocaleString()}</td>
+                  <td className="pr-3 text-zinc-200">{e.kind}</td>
+                  <td className="whitespace-nowrap pr-3">{e.jobId ? `J${e.jobId}` : (e.runId ?? "")}</td>
+                  <td className="break-all">{e.detail}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
     </div>
   );
 }
