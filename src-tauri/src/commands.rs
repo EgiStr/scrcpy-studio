@@ -642,6 +642,13 @@ pub fn ai_plan(state: State<AppState>, objective: String) -> Result<crate::agent
     Ok(plan)
 }
 
+/// Check every dependency a QA or AI run needs; slow (it asks the model once).
+#[tauri::command(async)]
+pub fn qa_doctor(state: State<AppState>) -> Vec<crate::doctor::Check> {
+    let adb = fleet_adb(&state).ok();
+    crate::doctor::checks(&QaConfig::load(&state.data_dir), adb.as_deref())
+}
+
 /// The audit log, newest first.
 #[tauri::command]
 pub fn qa_events(state: State<AppState>) -> Vec<crate::store::Event> {

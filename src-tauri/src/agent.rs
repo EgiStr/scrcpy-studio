@@ -92,7 +92,7 @@ fn split_command(line: &str) -> (String, Vec<String>) {
 /// The CLI as the user would start it: when the app itself was launched from inside a
 /// Claude session, that session's variables (child-session flags, its API base URL, MCP
 /// tool naming) are not passed on. An API key stays.
-fn base_command(line: &str) -> Command {
+pub(crate) fn base_command(line: &str) -> Command {
     let (program, args) = split_command(line);
     let mut cmd = Command::new(program);
     cmd.args(args);

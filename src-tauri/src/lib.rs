@@ -6,6 +6,7 @@ mod args;
 mod binary;
 mod commands;
 mod control;
+mod doctor;
 mod emulator;
 mod monitor;
 mod error;
@@ -174,6 +175,7 @@ pub fn run() {
             commands::qa_trace,
             commands::ai_plan,
             commands::qa_events,
+            commands::qa_doctor,
             commands::mon_devices,
             commands::mon_screen,
         ])

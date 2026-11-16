@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main, feat/**]
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      # The agent tests spawn python: the fake model CLI and the guard hook.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx vitest run
+      # Builds dist/, which the Tauri crate embeds even in tests.
+      - run: npm run build
+      # Tests that need a real phone or emulators are #[ignore] and stay off here.
+      - run: cargo test --release --lib
+        working-directory: src-tauri
+      - run: npx tauri build --bundles nsis
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scrcpy-studio-installer
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error

@@ -181,6 +181,13 @@ export interface AuditEvent {
   runId?: string | null;
   detail: string;
 }
+export interface SetupCheck {
+  name: string;
+  ok: boolean;
+  detail: string;
+  fix?: string | null;
+}
+export const qaDoctor = () => invoke<SetupCheck[]>("qa_doctor");
 export const qaEvents = () => invoke<AuditEvent[]>("qa_events");
 export const qaTrace = (id: number) => invoke<TraceEvent[]>("qa_trace", { id });
 

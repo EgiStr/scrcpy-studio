@@ -50,7 +50,7 @@ impl Default for QaConfig {
             max_parallel: 2,
             timeout_secs: 3600,
             ai_command: "claude".into(),
-            ai_model: "claude-fable-5-2".into(),
+            ai_model: "claude-sonnet-5-5".into(),
             ai_max_actions: 80,
         }
     }
@@ -113,8 +113,12 @@ impl QaConfig {
         Ok(sets)
     }
 
+    pub fn run_py(&self) -> Result<PathBuf> {
+        Ok(self.skill_root()?.join("scripts").join("run.py"))
+    }
+
     fn settings(&self, adb: &Path) -> Result<Settings> {
-        let run_py = self.skill_root()?.join("scripts").join("run.py");
+        let run_py = self.run_py()?;
         let adb = adb.to_path_buf();
         let probe = adb.clone();
         Ok(Settings {

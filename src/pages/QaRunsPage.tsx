@@ -19,6 +19,7 @@ import {
 } from "../lib/ipc";
 import { useDevices } from "../state/devices";
 import { Button, PanelTitle } from "../components/ui";
+import { SetupCheck } from "../components/SetupCheck";
 
 const BADGE: Record<QaStatus, string> = {
   queued: "bg-zinc-800 text-zinc-400",
@@ -159,6 +160,8 @@ export function QaRunsPage() {
           <Button onClick={saveConfig}>Save</Button>
         </div>
       )}
+
+      <SetupCheck />
 
       {error && <p className="mb-3 text-xs text-red-400">{error}</p>}
 

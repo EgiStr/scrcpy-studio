@@ -12,6 +12,7 @@ import {
   type QaConfig,
 } from "../lib/ipc";
 import { Button, PanelTitle } from "../components/ui";
+import { SetupCheck } from "../components/SetupCheck";
 
 const INPUT =
   "min-w-0 rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-sm text-zinc-100 outline-none focus:border-emerald-500";
@@ -100,6 +101,8 @@ export function AgentPage({ onMonitor }: { onMonitor: () => void }) {
           <Button onClick={() => qaConfigSet(config).catch((e) => setError(errMessage(e)))}>Save</Button>
         </div>
       )}
+
+      <SetupCheck />
 
       <textarea
         className={INPUT + " mb-2 h-28 w-full resize-y"}
