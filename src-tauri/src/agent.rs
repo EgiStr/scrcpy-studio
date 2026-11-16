@@ -312,6 +312,8 @@ def norm(p):
     return str(p or "").replace("\\", "/").rstrip("/").lower()
 
 def violation(name, args):
+    if name == "ToolSearch":
+        return None
     if not name.startswith(PREFIX):
         return "only the telkomsel-qa device tools are allowed"
     short = name[len(PREFIX):]
@@ -371,6 +373,11 @@ impl Guard {
     }
 
     pub fn violation(&self, name: &str, args: &serde_json::Value) -> Option<String> {
+        // The CLI loads the MCP tools' schemas through ToolSearch before it can call them.
+        // It reads schemas only; calls to anything it loads still pass through this check.
+        if name == "ToolSearch" {
+            return None;
+        }
         let prefix = format!("mcp__{SERVER}__");
         let Some(short) = name.strip_prefix(&prefix) else {
             return Some("only the telkomsel-qa device tools are allowed".into());
@@ -614,6 +621,7 @@ mod tests {
             ("mcp__telkomsel-qa__qa_record_step", json!({"run": r"C:\art\RUN-1\33061JEHN09954\J1-goal_AI-001\", "case": "AI-001"}), false),
             ("mcp__telkomsel-qa__qa_record_take", json!({"run": "C:/elsewhere", "case": "AI-001"}), true),
             ("Bash", json!({"command": "adb shell input tap 1 1"}), true),
+            ("ToolSearch", json!({"query": "select:mcp__telkomsel-qa__adb_input_tap"}), false),
         ]
     }
 
