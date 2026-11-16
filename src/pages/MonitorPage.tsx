@@ -37,9 +37,9 @@ const TRACE: Record<TraceEvent["kind"], string> = {
   done: "text-emerald-300",
 };
 
-function since(secs?: number | null) {
+function since(secs?: number | null, until?: number | null) {
   if (!secs) return "";
-  const d = Math.max(0, Math.floor(Date.now() / 1000) - secs);
+  const d = Math.max(0, (until ?? Math.floor(Date.now() / 1000)) - secs);
   return `${Math.floor(d / 60)}m ${String(d % 60).padStart(2, "0")}s`;
 }
 
@@ -75,7 +75,10 @@ function JobFeed({ job }: { job: QaJob }) {
     true,
     [job.id, live],
   );
-  useEffect(() => end.current?.scrollIntoView({ block: "nearest" }), [trace.length, log]);
+  // A block body: scrollIntoView may return a value, and React would call it as a cleanup.
+  useEffect(() => {
+    end.current?.scrollIntoView({ block: "nearest" });
+  }, [trace.length, log]);
 
   return (
     <div className="h-56 overflow-y-auto rounded border border-zinc-800 bg-black p-2 font-mono text-[11px] leading-snug">
@@ -97,7 +100,19 @@ function JobFeed({ job }: { job: QaJob }) {
   );
 }
 
-function DeviceCard({ d, job, liveScreen, onError }: { d: UsbDevice; job?: QaJob; liveScreen: boolean; onError: (e: string) => void }) {
+function DeviceCard({
+  d,
+  job,
+  leased,
+  liveScreen,
+  onError,
+}: {
+  d: UsbDevice;
+  job?: QaJob;
+  leased: boolean;
+  liveScreen: boolean;
+  onError: (e: string) => void;
+}) {
   const [shot, setShot] = useState<string>();
   const args = useConfig((s) => s.args);
   const addSession = useSessions((s) => s.add);
@@ -122,10 +137,10 @@ function DeviceCard({ d, job, liveScreen, onError }: { d: UsbDevice; job?: QaJob
           <span
             className={
               "rounded px-2 py-0.5 text-[11px] font-semibold uppercase " +
-              (!online ? "bg-red-500/20 text-red-300" : job ? "bg-amber-500/20 text-amber-300" : "bg-emerald-500/20 text-emerald-300")
+              (!online ? "bg-red-500/20 text-red-300" : leased ? "bg-amber-500/20 text-amber-300" : "bg-emerald-500/20 text-emerald-300")
             }
           >
-            {!online ? d.state : job ? `busy J${job.id}` : "free"}
+            {!online ? d.state : leased && job ? `busy J${job.id}` : "free"}
           </span>
         </div>
         {d.state === "unauthorized" && (
@@ -152,7 +167,7 @@ function DeviceCard({ d, job, liveScreen, onError }: { d: UsbDevice; job?: QaJob
               <span className="text-zinc-200">{job.scenario}</span>
               <span className="text-zinc-500">
                 {job.kind === "agent" ? `AI · ${job.actions} actions · ` : "scripted · "}
-                {since(job.startedAt)}
+                {since(job.startedAt, job.finishedAt)}
               </span>
             </div>
             {job.goal?.goal && <p className="text-xs text-zinc-400">{job.goal.goal}</p>}
@@ -247,7 +262,14 @@ export function MonitorPage() {
       )}
       <div className="grid grid-cols-[repeat(auto-fill,minmax(34rem,1fr))] gap-3">
         {devices?.map((d) => (
-          <DeviceCard key={d.serial} d={d} job={jobFor(d.serial)} liveScreen={liveScreen} onError={setError} />
+          <DeviceCard
+            key={d.serial}
+            d={d}
+            job={jobFor(d.serial)}
+            leased={leases.some((l) => l.serial === d.serial)}
+            liveScreen={liveScreen}
+            onError={setError}
+          />
         ))}
       </div>
     </div>

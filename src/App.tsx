@@ -11,6 +11,7 @@ import { EmulatorLabPage } from "./pages/EmulatorLabPage";
 import { QaRunsPage } from "./pages/QaRunsPage";
 import { AgentPage } from "./pages/AgentPage";
 import { MonitorPage } from "./pages/MonitorPage";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { useConfig } from "./state/config";
 import { binaryCurrent, profileSave } from "./lib/ipc";
 
@@ -54,18 +55,22 @@ export default function App() {
         <MenuBar page={page} onNavigate={setPage} />
 
         <div className="min-h-0 flex-1">
-          {page === "config" && <ConfigurationPage />}
-          {page === "control" && <ControlPage />}
-          {page === "profiles" && <ProfilesPage />}
-          {page === "emulators" && <EmulatorLabPage />}
-          {page === "qa" && <QaRunsPage />}
-          {page === "agent" && <AgentPage onMonitor={() => setPage("monitor")} />}
-          {page === "monitor" && <MonitorPage />}
-          {page === "shortcuts" && (
-            <div className="h-full overflow-y-auto p-5">
-              <ShortcutsPanel />
-            </div>
-          )}
+          <ErrorBoundary key={page}>
+            {page === "config" && <ConfigurationPage />}
+            {page === "control" && <ControlPage />}
+            {page === "profiles" && <ProfilesPage />}
+            {page === "emulators" && <EmulatorLabPage />}
+            {page === "qa" && <QaRunsPage />}
+            {page === "agent" && (
+              <AgentPage onMonitor={() => setPage("monitor")} />
+            )}
+            {page === "monitor" && <MonitorPage />}
+            {page === "shortcuts" && (
+              <div className="h-full overflow-y-auto p-5">
+                <ShortcutsPanel />
+              </div>
+            )}
+          </ErrorBoundary>
         </div>
 
         <CommandBar hasBinary={hasBinary} />

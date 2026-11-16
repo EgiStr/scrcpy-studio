@@ -89,10 +89,19 @@ fn split_command(line: &str) -> (String, Vec<String>) {
     (program, parts)
 }
 
+/// The CLI as the user would start it: when the app itself was launched from inside a
+/// Claude session, that session's variables (child-session flags, its API base URL, MCP
+/// tool naming) are not passed on. An API key stays.
 fn base_command(line: &str) -> Command {
     let (program, args) = split_command(line);
     let mut cmd = Command::new(program);
     cmd.args(args);
+    for (key, _) in std::env::vars_os() {
+        let k = key.to_string_lossy();
+        if k.starts_with("CLAUDE") || k == "ANTHROPIC_BASE_URL" {
+            cmd.env_remove(&key);
+        }
+    }
     cmd
 }
 
@@ -745,5 +754,9 @@ mod tests {
         assert_eq!(set["surface"], "goal");
         assert_eq!(set["cases"][0]["expected_keypoints"][0], "re:roaming :: Roaming");
         assert!(std::fs::read_to_string(dir.path().join("guard.py")).unwrap().contains("SERIAL = \"SER1\""));
+        let removed: Vec<String> = cmd.get_envs().filter(|(_, v)| v.is_none()).map(|(k, _)| k.to_string_lossy().to_string()).collect();
+        for (k, _) in std::env::vars().filter(|(k, _)| k.starts_with("CLAUDE")) {
+            assert!(removed.contains(&k), "{k} is not passed to the CLI");
+        }
     }
 }
