@@ -192,7 +192,7 @@ pub fn plan(cfg: &AgentConfig, objective: &str) -> Result<Plan> {
 }
 
 /// The first `{...}` in a model reply (it may wrap the JSON in prose or a code fence).
-fn extract_json(text: &str) -> Option<serde_json::Value> {
+pub(crate) fn extract_json(text: &str) -> Option<serde_json::Value> {
     let start = text.find('{')?;
     let end = text.rfind('}')?;
     serde_json::from_str(text.get(start..=end)?).ok()

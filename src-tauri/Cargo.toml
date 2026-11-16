@@ -28,6 +28,7 @@ rand = "0.8"
 mdns-sd = "0.11"
 flume = "0.11"
 base64 = "0.22"
+regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 [target.'cfg(windows)'.dependencies]

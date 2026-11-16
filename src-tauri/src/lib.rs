@@ -6,6 +6,7 @@ mod args;
 mod binary;
 mod commands;
 mod control;
+mod defects;
 mod doctor;
 mod emulator;
 mod monitor;
