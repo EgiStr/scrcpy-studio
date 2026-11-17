@@ -1,5 +1,5 @@
-// Phones: every phone on a USB cable with its health, a live screenshot, and the job that
-// holds it, showing the AI agent's calls as they happen or the scripted run's log.
+// Phones: every device the QA queue can use (USB phones, emulators, Wi-Fi phones) with its
+// health, a live screenshot, and the job that holds it, showing the AI agent's calls as they happen or the scripted run's log.
 import { useState } from "react";
 import { openPath } from "@tauri-apps/plugin-opener";
 import {
@@ -50,7 +50,9 @@ function DeviceCard({
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0">
             <div className="text-sm font-medium text-zinc-100">{d.model ?? d.serial}</div>
-            <div className="font-mono text-xs text-zinc-500">{d.serial}</div>
+            <div className="font-mono text-xs text-zinc-500">
+              {d.serial} · {d.connection === "usb" ? "USB" : d.connection === "wifi" ? "Wi-Fi" : "emulator"}
+            </div>
           </div>
           <span
             className={
@@ -165,7 +167,7 @@ export function MonitorPage() {
   return (
     <div className="h-full overflow-y-auto p-6">
       <p className="mb-4 text-xs text-zinc-500">
-        {`${devices?.length ?? 0} phones on USB · ${running} jobs running · ${queued} waiting for a phone`}
+        {`${devices?.length ?? 0} ${devices?.length === 1 ? "device" : "devices"} for QA · ${running} jobs running · ${queued} waiting for a phone`}
       </p>
       <label className="mb-4 flex items-center gap-2 text-xs text-zinc-400">
         <input type="checkbox" checked={liveScreen} onChange={(e) => setLiveScreen(e.target.checked)} />
@@ -174,7 +176,7 @@ export function MonitorPage() {
       {error && <p className="mb-3 text-xs text-red-400">{error}</p>}
       {devices && devices.length === 0 && (
         <p className="text-sm text-amber-300">
-          No phone on a USB cable. Plug one in, turn on USB debugging and allow this computer.
+          No phone or emulator. Plug in a phone with USB debugging on, or start an emulator in the Emulators tab.
         </p>
       )}
       <div className="grid grid-cols-[repeat(auto-fill,minmax(34rem,1fr))] gap-3">

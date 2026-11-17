@@ -279,6 +279,7 @@ export const aiPlan = (objective: string) => invoke<Plan>("ai_plan", { objective
 export interface UsbDevice {
   serial: string;
   state: string;
+  connection: "usb" | "emulator" | "wifi";
   model?: string | null;
   android?: string | null;
   battery?: number | null;

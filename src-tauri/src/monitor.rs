@@ -1,5 +1,6 @@
-//! Live monitoring of phones on a USB cable: health, the app in front, and a small
-//! screenshot, each read with an explicit serial.
+//! Live monitoring of every device the QA queue can use (phones on a cable, emulators,
+//! Wi-Fi phones): health, the app in front, and a small screenshot, each read with an
+//! explicit serial.
 
 use crate::error::Result;
 use base64::Engine;
@@ -12,6 +13,8 @@ pub struct UsbDevice {
     pub serial: String,
     /// adb state: device, unauthorized, offline.
     pub state: String,
+    /// How it is attached: usb, emulator or wifi.
+    pub connection: &'static str,
     pub model: Option<String>,
     pub android: Option<String>,
     pub battery: Option<u32>,
@@ -57,11 +60,22 @@ fn parse_status(text: &str) -> Status {
     st
 }
 
-/// Every phone on a cable, with its health when adb can reach it.
+/// How a serial is attached to adb.
+pub fn connection(serial: &str) -> &'static str {
+    if serial.starts_with("emulator-") {
+        "emulator"
+    } else if is_cable(serial) {
+        "usb"
+    } else {
+        "wifi"
+    }
+}
+
+/// Every device adb sees (the same ones the QA queue runs on), with its health when adb
+/// can reach it.
 pub fn usb_devices(adb: &Path) -> Result<Vec<UsbDevice>> {
     Ok(crate::adb::devices(adb)?
         .into_iter()
-        .filter(|d| is_cable(&d.serial))
         .map(|d| {
             let st = if d.state == "device" {
                 crate::adb::shell(adb, &d.serial, STATUS_SCRIPT).map(|t| parse_status(&t)).unwrap_or_default()
@@ -70,6 +84,7 @@ pub fn usb_devices(adb: &Path) -> Result<Vec<UsbDevice>> {
             };
             UsbDevice {
                 model: st.model.or(d.model),
+                connection: connection(&d.serial),
                 serial: d.serial,
                 state: d.state,
                 android: st.android,
@@ -110,6 +125,9 @@ mod tests {
     fn only_cable_phones_are_monitored() {
         assert!(is_cable("33061JEHN09954"));
         assert!(!is_cable("emulator-5554"));
+        assert_eq!(connection("emulator-5554"), "emulator");
+        assert_eq!(connection("R58M123ABC"), "usb");
+        assert_eq!(connection("192.168.1.5:5555"), "wifi");
         assert!(!is_cable("192.168.1.7:5555"));
         assert!(!is_cable("adb-33061JEHN09954-abc._adb-tls-connect._tcp"));
     }
