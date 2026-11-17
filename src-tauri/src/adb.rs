@@ -18,6 +18,10 @@ pub struct Device {
     pub model: Option<String>,
     /// true when the serial looks like `ip:port` (a TCP/IP connection).
     pub is_tcpip: bool,
+    /// The phone behind the serial (`ro.serialno`), the same over USB and wireless; filled in
+    /// by `list_devices` for online devices.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phone: Option<String>,
 }
 
 fn command(adb: &Path) -> Command {
@@ -87,6 +91,7 @@ pub fn parse_devices(stdout: &str) -> Vec<Device> {
             state,
             model,
             is_tcpip,
+            phone: None,
         });
     }
     devices
@@ -148,10 +153,15 @@ pub fn shell(adb: &Path, serial: &str, script: &str) -> Result<String> {
     run(adb, &["-s", serial, "shell", script])
 }
 
-/// The device's screen as PNG bytes.
-pub fn screencap(adb: &Path, serial: &str) -> Result<Vec<u8>> {
+/// One display's screen as PNG bytes; `surface` is its SurfaceFlinger id (None: the phone's screen).
+pub fn screencap_on(adb: &Path, serial: &str, surface: Option<&str>) -> Result<Vec<u8>> {
+    let mut args = vec!["-s", serial, "exec-out", "screencap"];
+    if let Some(id) = surface {
+        args.extend(["-d", id]);
+    }
+    args.push("-p");
     let out = command(adb)
-        .args(["-s", serial, "exec-out", "screencap", "-p"])
+        .args(&args)
         .output()
         .map_err(|e| AppError::Adb(format!("failed to run adb: {e}")))?;
     if !out.status.success() || out.stdout.len() < 8 {

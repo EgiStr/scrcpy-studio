@@ -44,7 +44,12 @@ pub fn binary_update(state: State<AppState>) -> Result<Binaries> {
 
 #[tauri::command]
 pub fn list_devices(state: State<AppState>) -> Result<Vec<Device>> {
-    adb::devices(&fleet_adb(&state)?)
+    let adb = fleet_adb(&state)?;
+    let mut devices = adb::devices(&adb)?;
+    for d in devices.iter_mut().filter(|d| d.state == "device") {
+        d.phone = Some(crate::qa::phone_id(&adb, &d.serial));
+    }
+    Ok(devices)
 }
 
 #[tauri::command]
@@ -752,4 +757,16 @@ pub fn mon_devices(state: State<AppState>) -> Result<Vec<crate::monitor::UsbDevi
 #[tauri::command(async)]
 pub fn mon_screen(state: State<AppState>, serial: String) -> Result<String> {
     crate::monitor::screen_data_url(&fleet_adb(&state)?, &serial, 360)
+}
+
+/// A running job's hidden display, as a small screenshot.
+#[tauri::command(async)]
+pub fn qa_frame(state: State<AppState>, id: u32) -> Result<String> {
+    state.qa.frame(&fleet_adb(&state)?, id)
+}
+
+/// A view-only window on a running job's hidden display.
+#[tauri::command]
+pub fn qa_watch(state: State<AppState>, id: u32) -> Result<()> {
+    state.qa.watch(id)
 }

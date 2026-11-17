@@ -159,6 +159,11 @@ export interface QaJob {
   serial?: string | null;
   /** The hidden display the job ran on; absent for the phone's own screen. */
   display?: number | null;
+  mode?: QaMode;
+  /** It opens Veronika (one such job per phone at a time). */
+  veronika?: boolean;
+  /** A test set split across places: its jobs share this and are merged when the run ends. */
+  group?: string | null;
   evidenceDir?: string | null;
   exitCode?: number | null;
   note?: string | null;
@@ -167,6 +172,9 @@ export interface QaJob {
   finishedAt?: number | null;
 }
 export interface QaLease {
+  /** The phone the job runs on (one phone may be on USB and wireless at once). */
+  phone: string;
+  /** The adb serial the job reaches it by. */
   serial: string;
   /** Session 1 or 2 on the phone; null when the job has the whole device. */
   slot?: number | null;
@@ -177,16 +185,23 @@ export interface QaLease {
 export const qaConfigGet = () => invoke<QaConfig>("qa_config_get");
 export const qaConfigSet = (config: QaConfig) => invoke<void>("qa_config_set", { config });
 export const qaTestsets = () => invoke<string[]>("qa_testsets");
+/** Where jobs go on a physical phone: hidden sessions when on (auto), its own screen, or sessions only. */
+export type QaMode = "auto" | "screen" | "hidden";
 export interface QaScenario {
   testset: string;
   only?: string;
   goal?: PlanItem;
   devices?: string[];
+  mode?: QaMode;
 }
 export const qaSubmit = (scenarios: QaScenario[]) =>
   invoke<string>("qa_submit", { scenarios });
 export const qaState = () => invoke<{ jobs: QaJob[]; leases: QaLease[] }>("qa_state");
 export const qaCancel = (id: number) => invoke<void>("qa_cancel", { id });
+/** A running job's hidden display, as a small screenshot (`data:` URL). */
+export const qaFrame = (id: number) => invoke<string>("qa_frame", { id });
+/** Open a view-only window on a running job's hidden display. */
+export const qaWatch = (id: number) => invoke<void>("qa_watch", { id });
 export const qaLog = (id: number) => invoke<string>("qa_log", { id });
 export interface AuditEvent {
   at: number;

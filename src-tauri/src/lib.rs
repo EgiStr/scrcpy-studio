@@ -187,6 +187,8 @@ pub fn run() {
             commands::qa_investigate,
             commands::mon_devices,
             commands::mon_screen,
+            commands::qa_frame,
+            commands::qa_watch,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

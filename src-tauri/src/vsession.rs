@@ -27,7 +27,9 @@ const SERVER: &str = "com.genymobile.scrcpy.Server";
 
 pub struct Session {
     pub display: u32,
-    serial: String,
+    /// SurfaceFlinger's id for the display, which `screencap -d` takes; None if not found.
+    pub surface: Option<String>,
+    pub serial: String,
     adb: PathBuf,
     child: Child,
     /// Device-side server pids. Ending them ends the session cleanly: the client sees the
@@ -188,7 +190,8 @@ impl Session {
         };
         let after = servers(adb, serial, &SIGNATURE);
         let mine = after.into_iter().filter(|p| !before.contains(p)).collect();
-        let session = Session { display, serial: serial.into(), adb: adb.into(), child, servers: mine };
+        let surface = parse_surface_id(&shell(adb, serial, "cmd display get-displays"), &shell(adb, serial, "dumpsys SurfaceFlinger --display-id"), display);
+        let session = Session { display, surface, serial: serial.into(), adb: adb.into(), child, servers: mine };
 
         let dump = || shell(adb, serial, "dumpsys activity activities");
         let opened = match sibling {
@@ -228,6 +231,17 @@ impl Session {
             crate::emulator::kill_tree(&mut self.child);
         }
     }
+}
+
+/// SurfaceFlinger's id of a logical display: both name the display's uniqueId.
+fn parse_surface_id(displays: &str, flinger: &str, display: u32) -> Option<String> {
+    let head = format!("Display id {display}:");
+    let line = displays.lines().find(|l| l.trim_start().starts_with(&head))?;
+    let rest = &line[line.find("uniqueId \"")? + 10..];
+    let unique = &rest[..rest.find('"')?];
+    let tag = format!("uniqueId=\"{unique}\"");
+    let sf = flinger.lines().find(|l| l.starts_with("Display ") && l.contains(&tag))?;
+    sf.split_whitespace().nth(1).filter(|id| id.chars().all(|c| c.is_ascii_digit())).map(str::to_string)
 }
 
 fn new_display_id(line: &str) -> Option<u32> {
@@ -274,6 +288,15 @@ Display #0 (activities from top to bottom):
  31000 app_process / com.genymobile.scrcpy.Server 5.0.1 video_bit_rate=8000000";
         assert_eq!(parse_servers(ps, &SIGNATURE), vec!["30815"]);
         assert_eq!(parse_servers(ps, &[]).len(), 2, "a mirror's server is not a session's");
+    }
+
+    #[test]
+    fn finds_the_surface_id_screencap_needs() {
+        let displays = "Displays:\n  Display id 0: DisplayInfo{\"Built-in Screen\", displayId 0, uniqueId \"local:4619827259835644672\", app 1080 x 2400}\n  Display id 21: DisplayInfo{\"scrcpy\", displayId 21, uniqueId \"virtual:com.android.shell,2000,scrcpy,0\", app 1080 x 2400}";
+        let flinger = "Display 4619827259835644672 (HWC display 0): port=0 pnpId=GGL displayName=\"\" uniqueId=\"local:4619827259835644672\"\nDisplay 11529215046068469771 (virtual) uniqueId=\"virtual:com.android.shell,2000,scrcpy,0\"";
+        assert_eq!(parse_surface_id(displays, flinger, 21).as_deref(), Some("11529215046068469771"));
+        assert_eq!(parse_surface_id(displays, flinger, 0).as_deref(), Some("4619827259835644672"));
+        assert_eq!(parse_surface_id(displays, flinger, 5), None);
     }
 
     #[test]

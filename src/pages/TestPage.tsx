@@ -9,7 +9,7 @@ import { usePoll } from "../components/qa";
 import { AiPlanner } from "../components/AiPlanner";
 import { TestsetPicker } from "../components/TestsetPicker";
 import { RunList } from "../components/RunList";
-import { DeviceTarget, type Target } from "../components/DeviceTarget";
+import { DeviceTarget, phoneBusy, phonesOf, type Target } from "../components/DeviceTarget";
 
 type Mode = "ai" | "sets";
 
@@ -22,11 +22,16 @@ export function TestPage({ onDevices, onSettings }: { onDevices: () => void; onS
   const [leases, setLeases] = useState<QaLease[]>([]);
   const [open, setOpen] = useState<string>();
   const devices = useDevices((s) => s.devices);
-  const [target, setTarget] = useState<Target>({ serials: [], spread: "share" });
+  const [target, setTarget] = useState<Target>({ serials: [], spread: "share", mode: "auto" });
   const [maxParallel, setMaxParallel] = useState(2);
+  const [sessions, setSessions] = useState(2);
   useEffect(() => {
     qaConfigGet()
-      .then((c) => setMaxParallel(c.maxParallel))
+      .then((c) => {
+        setMaxParallel(c.maxParallel);
+        setSessions(c.phoneSessions);
+        if (c.phoneSessions === 0) setTarget((t) => (t.mode === "hidden" ? { ...t, mode: "auto" } : t));
+      })
       .catch(() => undefined);
   }, []);
 
@@ -41,8 +46,8 @@ export function TestPage({ onDevices, onSettings }: { onDevices: () => void; onS
     [],
   );
 
-  const ready = devices.filter((d) => d.state === "device");
-  const free = ready.filter((d) => !leases.some((l) => l.serial === d.serial)).length;
+  const ready = phonesOf(devices);
+  const free = ready.filter((d) => !phoneBusy(d, leases)).length;
   const running = jobs.filter((j) => j.status === "running").length;
   const queued = jobs.filter((j) => j.status === "queued").length;
 
@@ -80,7 +85,7 @@ export function TestPage({ onDevices, onSettings }: { onDevices: () => void; onS
               onChange={setMode}
             />
           </div>
-          <DeviceTarget devices={devices} leases={leases} maxParallel={maxParallel} value={target} onChange={setTarget} />
+          <DeviceTarget devices={devices} leases={leases} maxParallel={maxParallel} sessions={sessions} value={target} onChange={setTarget} />
           {mode === "ai" ? (
             <AiPlanner target={target} onQueued={setOpen} />
           ) : (

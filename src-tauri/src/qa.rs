@@ -129,10 +129,16 @@ impl QaConfig {
         let adb = adb.to_path_buf();
         let probe = adb.clone();
         let scrcpy = adb.with_file_name(if cfg!(windows) { "scrcpy.exe" } else { "scrcpy" });
+        // A run.py that knows sessions goes back to its first screen instead of restarting the
+        // app; an older one would end the phone's other session, so its jobs take the whole phone.
+        let scripts = std::fs::read_to_string(&run_py).is_ok_and(|t| t.contains("act_back_to_root"));
+        let (python, lister) = (PathBuf::from(&self.python), run_py.clone());
         Ok(Settings {
+            cases: Arc::new(move |testset, only| list_cases(&python, &lister, testset, only)),
             sessions: SessionSettings {
                 per_phone: self.phone_sessions.min(2),
                 physical_first: self.physical_first,
+                scripts,
                 scrcpy: scrcpy.is_file().then_some(scrcpy),
                 adb: Some(adb.clone()),
             },
@@ -150,17 +156,191 @@ impl QaConfig {
     }
 }
 
-/// Serials that are online and have finished booting (emulators and USB/wireless devices alike).
-fn ready_devices(adb: &Path) -> Vec<String> {
-    crate::adb::devices(adb)
+/// One phone, however many ways adb reaches it: a phone on USB and wireless debugging at once
+/// is listed twice by adb but runs one test at a time (or its sessions) like any other phone.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Phone {
+    /// `ro.serialno` for a physical phone, the adb serial for an emulator.
+    pub id: String,
+    /// The adb serials that reach it, USB first.
+    pub serials: Vec<String>,
+}
+
+impl Phone {
+    #[cfg(test)]
+    pub fn one(serial: &str) -> Self {
+        Self { id: serial.into(), serials: vec![serial.into()] }
+    }
+
+    /// Is `name` this phone, by its id or one of its serials? (Jobs pin devices by serial.)
+    fn is(&self, name: &str) -> bool {
+        self.id == name || self.serials.iter().any(|s| s == name)
+    }
+
+    fn physical(&self) -> bool {
+        self.serials.first().is_some_and(|s| is_physical(s))
+    }
+}
+
+/// Devices that are online and have finished booting, one entry per phone.
+fn ready_devices(adb: &Path) -> Vec<Phone> {
+    let serials: Vec<String> = crate::adb::devices(adb)
         .unwrap_or_default()
         .into_iter()
         .filter(|d| d.state == "device" && crate::adb::boot_completed(adb, &d.serial))
         .map(|d| d.serial)
+        .collect();
+    group_phones(serials.into_iter().map(|s| {
+        let id = phone_id(adb, &s);
+        (s, id)
+    }))
+}
+
+/// The phone behind a serial: its `ro.serialno`, the same over USB and wireless. Asked once
+/// per serial; an emulator, or a phone that does not answer, is its own serial.
+pub(crate) fn phone_id(adb: &Path, serial: &str) -> String {
+    static IDS: std::sync::OnceLock<Mutex<HashMap<String, String>>> = std::sync::OnceLock::new();
+    let ids = IDS.get_or_init(Default::default);
+    if !is_physical(serial) {
+        return serial.to_string();
+    }
+    if let Some(id) = ids.lock().unwrap().get(serial) {
+        return id.clone();
+    }
+    match crate::adb::shell(adb, serial, "getprop ro.serialno").map(|o| o.trim().to_string()) {
+        Ok(id) if !id.is_empty() => {
+            ids.lock().unwrap().insert(serial.to_string(), id.clone());
+            id
+        }
+        _ => serial.to_string(),
+    }
+}
+
+fn group_phones(pairs: impl IntoIterator<Item = (String, String)>) -> Vec<Phone> {
+    let mut phones: Vec<Phone> = Vec::new();
+    for (serial, id) in pairs {
+        match phones.iter_mut().find(|p| p.id == id) {
+            Some(p) => p.serials.push(serial),
+            None => phones.push(Phone { id, serials: vec![serial] }),
+        }
+    }
+    for p in &mut phones {
+        p.serials.sort_by_key(|s| crate::monitor::connection(s) != "usb");
+    }
+    phones
+}
+
+/// One case of a test set, as `run.py --list` prints it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaseInfo {
+    pub id: String,
+    pub surface: String,
+    pub repeat: u32,
+    /// The case whose chat this one continues; it runs right after it, in the same job.
+    pub follows: Option<String>,
+}
+
+impl CaseInfo {
+    /// Does it open Veronika's chat? The goal surface may; count it as if it does.
+    fn chat(&self) -> bool {
+        self.surface == "veronika" || self.surface == "goal"
+    }
+}
+
+/// `run.py --list` lines: `ID METHOD SURFACE [TYPE] xN  [<- PARENT  ]QUESTION`. Other lines
+/// (the M1 sample and the totals) are skipped.
+fn parse_list(text: &str) -> Vec<CaseInfo> {
+    let is_method = |t: &str| t.len() == 2 && t.starts_with('m') && t[1..].chars().all(|c| c.is_ascii_digit());
+    let is_repeat = |t: &str| t.len() > 1 && t.starts_with('x') && t[1..].chars().all(|c| c.is_ascii_digit());
+    text.lines()
+        .filter_map(|line| {
+            let t: Vec<&str> = line.split_whitespace().collect();
+            if t.len() < 4 || !is_method(t[1]) {
+                return None;
+            }
+            let at = (3..t.len().min(5)).find(|&i| is_repeat(t[i]))?;
+            Some(CaseInfo {
+                id: t[0].to_string(),
+                surface: t[2].to_string(),
+                repeat: t[at][1..].parse().unwrap_or(1),
+                follows: (t.get(at + 1) == Some(&"<-")).then(|| t.get(at + 2).map(|p| p.to_string())).flatten(),
+            })
+        })
         .collect()
 }
 
+/// The cases `run.py` would run for a test set (after its M1 sample), or None when it cannot
+/// list them. Never touches a device.
+fn list_cases(python: &Path, run_py: &Path, testset: &str, only: Option<&str>) -> Option<Vec<CaseInfo>> {
+    let mut cmd = Command::new(python);
+    cmd.arg(run_py).arg(testset).arg("--list");
+    if let Some(only) = only {
+        cmd.args(["--only", only]);
+    }
+    cmd.current_dir(std::env::temp_dir()).env("PYTHONIOENCODING", "utf-8").stdin(Stdio::null());
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let out = cmd.output().ok().filter(|o| o.status.success())?;
+    Some(parse_list(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Split a test set's cases into at most `k_chat` jobs that open Veronika (a phone has one
+/// Veronika, so chat jobs on one phone run one at a time) and native-screen jobs that fill the
+/// rest of the `k_total` places. A follow-up chain stays in one job, in order. Each pool is
+/// balanced by longest-first (LPT) on its runs; ids keep the test set's order within a job.
+fn shard(cases: &[CaseInfo], k_chat: usize, k_total: usize) -> Vec<(Vec<String>, bool)> {
+    // (case indexes, runs, opens Veronika)
+    let mut chains: Vec<(Vec<usize>, u32, bool)> = Vec::new();
+    for (i, c) in cases.iter().enumerate() {
+        match chains.last_mut() {
+            Some(last) if c.follows.is_some() => {
+                last.0.push(i);
+                last.1 += c.repeat.max(1);
+                last.2 |= c.chat();
+            }
+            _ => chains.push((vec![i], c.repeat.max(1), c.chat())),
+        }
+    }
+    let lpt = |mut pool: Vec<(Vec<usize>, u32, bool)>, k: usize| -> Vec<Vec<usize>> {
+        if pool.is_empty() {
+            return Vec::new();
+        }
+        let k = k.clamp(1, pool.len());
+        pool.sort_by_key(|c| std::cmp::Reverse(c.1));
+        let mut bins: Vec<(u32, Vec<usize>)> = vec![(0, Vec::new()); k];
+        for (idx, runs, _) in pool {
+            let bin = bins.iter_mut().min_by_key(|b| b.0).unwrap();
+            bin.0 += runs;
+            bin.1.extend(idx);
+        }
+        bins.into_iter().map(|(_, mut b)| {
+            b.sort_unstable();
+            b
+        }).collect()
+    };
+    let (chat, native): (Vec<_>, Vec<_>) = chains.into_iter().partition(|c| c.2);
+    let chat_bins = lpt(chat, k_chat);
+    let native_k = if chat_bins.is_empty() { k_total } else { k_total.saturating_sub(chat_bins.len()).max(1) };
+    let ids = |b: Vec<usize>| b.into_iter().map(|i| cases[i].id.clone()).collect::<Vec<_>>();
+    let mut out: Vec<(Vec<String>, bool)> = chat_bins.into_iter().map(|b| (ids(b), true)).collect();
+    out.extend(lpt(native, native_k).into_iter().map(|b| (ids(b), false)));
+    out
+}
+
 // ---- jobs ----
+
+/// Where a run's jobs go on a physical phone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    /// Hidden sessions on physical phones when they are on, else the whole device.
+    #[default]
+    Auto,
+    /// The phone's own screen, one job per phone (to watch it, or mirror it).
+    Screen,
+    /// Hidden sessions on physical phones only.
+    Hidden,
+}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Scenario {
@@ -174,6 +354,8 @@ pub struct Scenario {
     /// Serials this scenario may run on; empty means any free device.
     #[serde(default)]
     pub devices: Vec<String>,
+    #[serde(default)]
+    pub mode: Mode,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -238,6 +420,15 @@ pub struct Job {
     /// The hidden display the job ran on; None for the phone's own screen.
     #[serde(default)]
     pub display: Option<u32>,
+    #[serde(default)]
+    pub mode: Mode,
+    /// It opens Veronika, so it never runs beside another such job on the same phone.
+    #[serde(default)]
+    pub veronika: bool,
+    /// One test set split across places: the jobs of a group share it and their results are
+    /// merged into `<run>/merged-<group>/run.json` when the run ends.
+    #[serde(default)]
+    pub group: Option<String>,
     pub evidence_dir: Option<String>,
     pub exit_code: Option<i32>,
     pub note: Option<String>,
@@ -249,7 +440,12 @@ pub struct Job {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Lease {
+    /// The phone (`Phone::id`) the place is on.
+    pub phone: String,
+    /// The adb serial the job reaches it by.
     pub serial: String,
+    /// The job opens Veronika (one per phone).
+    pub veronika: bool,
     /// The session (1 or 2) on that phone, or None for the whole device.
     pub slot: Option<u8>,
     pub job_id: u32,
@@ -311,10 +507,10 @@ pub enum Slot {
     Session(u8),
 }
 
-fn lease_key(serial: &str, slot: Slot) -> String {
+fn lease_key(phone: &str, slot: Slot) -> String {
     match slot {
-        Slot::Whole => serial.to_string(),
-        Slot::Session(n) => format!("{serial}#{n}"),
+        Slot::Whole => phone.to_string(),
+        Slot::Session(n) => format!("{phone}#{n}"),
     }
 }
 
@@ -323,9 +519,11 @@ pub struct Want {
     pub id: u32,
     /// Devices it may run on; empty means any.
     pub allowed: Vec<String>,
-    /// An AI job; only those run in a session (a scripted run restarts the app, which would
-    /// end the phone's other session).
-    pub agent: bool,
+    /// It can run on a hidden display: AI jobs, and scripted ones when `run.py` knows sessions.
+    pub session: bool,
+    /// It opens Veronika, of which a phone has one: opening it in one session takes it from the other.
+    pub veronika: bool,
+    pub mode: Mode,
 }
 
 fn is_physical(serial: &str) -> bool {
@@ -335,24 +533,31 @@ fn is_physical(serial: &str) -> bool {
 /// Pair queued jobs (oldest first) with a free place to run. A leased place is never handed
 /// out, and a job waiting for its own device does not hold up later jobs.
 ///
-/// With sessions on, a physical phone runs AI jobs on hidden displays: session 1 only when
-/// nothing runs on the phone (it restarts the app), session 2 only beside a running session 1
-/// (MyTelkomsel makes its second task from the first). A scripted job takes the whole phone.
-fn assign(queued: &[Want], ready: &[String], leased: &HashMap<String, Lease>, slots: usize, per_phone: usize, physical_first: bool) -> Vec<(u32, String, Slot)> {
+/// With sessions on, a physical phone runs jobs on hidden displays, never on its own screen
+/// (unless the job asks for the screen): session 1 only when nothing runs on the phone (it
+/// restarts the app), session 2 only beside a running session 1 (MyTelkomsel makes its second
+/// task from the first). Two jobs that open Veronika never share a phone. A job that cannot
+/// run in a session takes the whole phone.
+fn assign(queued: &[Want], ready: &[Phone], leased: &HashMap<String, Lease>, slots: usize, per_phone: usize, physical_first: bool) -> Vec<(u32, String, Slot)> {
     let mut taken: std::collections::HashSet<String> = leased.keys().cloned().collect();
-    let mut devices: Vec<&String> = ready.iter().collect();
+    let mut chatting: std::collections::HashSet<String> = leased.values().filter(|l| l.veronika).map(|l| l.phone.clone()).collect();
+    let mut devices: Vec<&Phone> = ready.iter().collect();
     if physical_first {
-        devices.sort_by_key(|s| !is_physical(s));
+        devices.sort_by_key(|p| !p.physical());
     }
     let mut out = Vec::new();
     for want in queued {
         if out.len() >= slots {
             break;
         }
-        let pick = devices.iter().filter(|s| want.allowed.is_empty() || want.allowed.contains(s)).find_map(|s| {
+        let pick = devices.iter().filter(|p| want.allowed.is_empty() || want.allowed.iter().any(|a| p.is(a))).find_map(|p| {
+            let s = &p.id;
+            if want.veronika && chatting.contains(s) {
+                return None;
+            }
             let has = |slot| taken.contains(&lease_key(s, slot));
             let busy = has(Slot::Whole) || has(Slot::Session(1)) || has(Slot::Session(2));
-            let slot = if want.agent && per_phone > 0 && is_physical(s) {
+            let slot = if hidden_ok(want.session, want.mode, per_phone, p) {
                 if !busy {
                     Some(Slot::Session(1))
                 } else if per_phone >= 2 && has(Slot::Session(1)) && !has(Slot::Session(2)) {
@@ -360,19 +565,84 @@ fn assign(queued: &[Want], ready: &[String], leased: &HashMap<String, Lease>, sl
                 } else {
                     None
                 }
-            } else if !busy {
+            } else if want.mode != Mode::Hidden && !busy {
                 Some(Slot::Whole)
             } else {
                 None
             };
-            slot.map(|slot| ((*s).clone(), slot))
+            slot.map(|slot| (s.clone(), slot))
         });
-        if let Some((serial, slot)) = pick {
-            taken.insert(lease_key(&serial, slot));
-            out.push((want.id, serial, slot));
+        if let Some((phone, slot)) = pick {
+            taken.insert(lease_key(&phone, slot));
+            if want.veronika {
+                chatting.insert(phone.clone());
+            }
+            out.push((want.id, phone, slot));
         }
     }
     out
+}
+
+/// Does a job run on a hidden display on this phone?
+fn hidden_ok(session: bool, mode: Mode, per_phone: usize, p: &Phone) -> bool {
+    session && mode != Mode::Screen && per_phone > 0 && p.physical()
+}
+
+/// How many jobs of a scenario can run at once on these phones: (Veronika jobs, all jobs).
+fn capacity(phones: &[Phone], allowed: &[String], session: bool, mode: Mode, per_phone: usize) -> (usize, usize) {
+    let mut chat = 0;
+    let mut places = 0;
+    for p in phones.iter().filter(|p| allowed.is_empty() || allowed.iter().any(|a| p.is(a))) {
+        let hidden = hidden_ok(session, mode, per_phone, p);
+        if mode == Mode::Hidden && !hidden {
+            continue;
+        }
+        chat += 1;
+        places += if hidden { per_phone } else { 1 };
+    }
+    (chat, places)
+}
+
+/// A job a scenario becomes.
+struct Planned {
+    only: Option<String>,
+    label: String,
+    veronika: bool,
+    group: Option<String>,
+}
+
+/// A scripted scenario over a whole test set is split across the places it can use (see
+/// `shard`); anything else is one job. `index` makes the group unique within the run.
+fn plan(settings: &Settings, s: &Scenario, index: usize, phones: &mut Option<Vec<Phone>>) -> Vec<Planned> {
+    let only = s.only.as_deref().map(str::trim).filter(|o| !o.is_empty());
+    let one = |veronika| vec![Planned { only: only.map(str::to_string), label: scenario_label(s), veronika, group: None }];
+    if s.goal.is_some() {
+        return one(true);
+    }
+    let Some(cases) = (settings.cases)(&s.testset, only) else { return one(true) };
+    let veronika = cases.iter().any(CaseInfo::chat);
+    if only.is_some() || cases.len() < 2 {
+        return one(veronika);
+    }
+    let phones = phones.get_or_insert_with(|| (settings.devices)());
+    let sessions = &settings.sessions;
+    let (chat, places) = capacity(phones, &s.devices, sessions.scripts, s.mode, sessions.per_phone());
+    let cap = settings.max_parallel.max(1);
+    let bins = shard(&cases, chat.min(cap), places.min(cap));
+    if places.min(cap) < 2 || bins.len() < 2 {
+        return one(veronika);
+    }
+    let stem = scenario_label(s);
+    let n = bins.len();
+    bins.into_iter()
+        .enumerate()
+        .map(|(i, (ids, veronika))| Planned {
+            only: Some(ids.join(",")),
+            label: format!("{stem} [{}/{n}]", i + 1),
+            veronika,
+            group: Some(format!("{stem}-{}", index + 1)),
+        })
+        .collect()
 }
 
 // ---- engine ----
@@ -389,10 +659,12 @@ pub struct Runner {
 #[derive(Clone)]
 pub struct Settings {
     pub runner: Runner,
+    /// A test set's cases (`run.py --list`), to split it across places; None: run it whole.
+    pub cases: Arc<dyn Fn(&str, Option<&str>) -> Option<Vec<CaseInfo>> + Send + Sync>,
     pub artifacts: PathBuf,
     pub max_parallel: usize,
     pub timeout: Duration,
-    pub devices: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    pub devices: Arc<dyn Fn() -> Vec<Phone> + Send + Sync>,
     /// None when the skill checkout has no MCP server: goal jobs then end as errors.
     pub agent: Option<AgentConfig>,
     pub sessions: SessionSettings,
@@ -403,6 +675,8 @@ pub struct SessionSettings {
     /// AI tests per physical phone, each on a hidden display (0: none, the whole phone).
     pub per_phone: usize,
     pub physical_first: bool,
+    /// `run.py` runs in a session (it never restarts the shared app); else only AI jobs do.
+    pub scripts: bool,
     /// The bundled scrcpy, which opens the displays; without it there are no sessions.
     pub scrcpy: Option<PathBuf>,
     pub adb: Option<PathBuf>,
@@ -428,8 +702,10 @@ struct Inner {
     meters: HashMap<u32, Arc<Meter>>,
     /// Open session displays, by job.
     sessions: HashMap<u32, crate::vsession::Session>,
+    /// View-only windows on a job's hidden display (Watch), by job.
+    watchers: HashMap<u32, Child>,
     leases: HashMap<String, Lease>,
-    /// Consecutive device checks a leased serial was missing from.
+    /// Consecutive device checks a lease's serial was missing from, by lease key.
     missing: HashMap<String, u32>,
     ticks: u64,
     settings: Option<Settings>,
@@ -501,33 +777,58 @@ impl QaEngine {
         if scenarios.is_empty() {
             return Err(AppError::InvalidArgs("no scenarios selected".into()));
         }
+        let sessions = &settings.sessions;
+        for s in scenarios.iter().filter(|s| s.mode == Mode::Hidden) {
+            if sessions.per_phone() == 0 {
+                return Err(AppError::InvalidArgs("hidden sessions are off: set AI tests per phone to 1 or 2 in Settings".into()));
+            }
+            if s.goal.is_none() && !sessions.scripts {
+                return Err(AppError::InvalidArgs("this QA skill's run.py cannot run in a hidden session; update the skill or run on the phone's screen".into()));
+            }
+        }
+        // Listing a test set's cases runs python and asking for devices runs adb: both before the lock.
+        let mut phones = None;
+        let planned: Vec<(Scenario, Vec<Planned>)> = scenarios
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut s)| {
+                s.devices = s.devices.iter().map(|d| d.trim().to_string()).filter(|d| !d.is_empty()).collect();
+                let p = plan(&settings, &s, i, &mut phones);
+                (s, p)
+            })
+            .collect();
         let mut inner = self.inner.lock().unwrap();
         inner.next_run += 1;
         let run_id = format!("RUN-{}-{:02}", now(), inner.next_run);
-        for s in scenarios {
-            inner.next_id += 1;
-            let job = Job {
-                id: inner.next_id,
-                run_id: run_id.clone(),
-                scenario: scenario_label(&s),
-                testset: s.testset,
-                only: s.only.map(|o| o.trim().to_string()).filter(|o| !o.is_empty()),
-                kind: if s.goal.is_some() { "agent" } else { "script" }.into(),
-                goal: s.goal,
-                devices: s.devices.into_iter().map(|d| d.trim().to_string()).filter(|d| !d.is_empty()).collect(),
-                actions: 0,
-                status: Status::Queued,
-                serial: None,
-                display: None,
-                evidence_dir: None,
-                exit_code: None,
-                note: None,
-                queued_at: now(),
-                started_at: None,
-                finished_at: None,
-            };
-            persist(&inner, &job);
-            inner.jobs.push(job);
+        for (s, jobs) in planned {
+            for p in jobs {
+                inner.next_id += 1;
+                let job = Job {
+                    id: inner.next_id,
+                    run_id: run_id.clone(),
+                    scenario: p.label,
+                    testset: s.testset.clone(),
+                    only: p.only,
+                    kind: if s.goal.is_some() { "agent" } else { "script" }.into(),
+                    goal: s.goal.clone(),
+                    devices: s.devices.clone(),
+                    actions: 0,
+                    status: Status::Queued,
+                    serial: None,
+                    display: None,
+                    mode: s.mode,
+                    veronika: p.veronika,
+                    group: p.group,
+                    evidence_dir: None,
+                    exit_code: None,
+                    note: None,
+                    queued_at: now(),
+                    started_at: None,
+                    finished_at: None,
+                };
+                persist(&inner, &job);
+                inner.jobs.push(job);
+            }
         }
         let labels: Vec<String> = inner.jobs.iter().filter(|j| j.run_id == run_id).map(|j| format!("J{} {}", j.id, j.scenario)).collect();
         audit(&inner, "submit", None, Some(&run_id), &labels.join(", "));
@@ -557,6 +858,60 @@ impl QaEngine {
             Some(_) => Ok(()),
             None => Err(AppError::NotFound(format!("job {id}"))),
         }
+    }
+
+    /// A running job's hidden display as a small screenshot (`data:` URL), for monitoring.
+    pub fn frame(&self, adb: &Path, id: u32) -> Result<String> {
+        let (serial, surface) = {
+            let inner = self.inner.lock().unwrap();
+            let s = inner.sessions.get(&id).ok_or_else(|| AppError::NotFound(format!("a hidden display for job {id}")))?;
+            (s.serial.clone(), s.surface.clone())
+        };
+        // Without its own id, screencap would show the phone's screen, which is the user's.
+        let surface = surface.ok_or_else(|| AppError::NotFound(format!("the screen id of job {id}'s display")))?;
+        crate::monitor::display_data_url(adb, &serial, Some(&surface), 360)
+    }
+
+    /// Open a view-only window on a running job's hidden display. Closing it leaves the job
+    /// running; it closes by itself when the job ends. One window per job.
+    pub fn watch(&self, id: u32) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(w) = inner.watchers.get_mut(&id) {
+            if matches!(w.try_wait(), Ok(None)) {
+                return Ok(());
+            }
+        }
+        let s = inner.sessions.get(&id).ok_or_else(|| AppError::NotFound(format!("a hidden display for job {id}")))?;
+        let (serial, display) = (s.serial.clone(), s.display);
+        let sessions = inner.settings.as_ref().map(|st| st.sessions.clone()).unwrap_or_default();
+        let (Some(scrcpy), Some(adb)) = (sessions.scrcpy, sessions.adb) else {
+            return Err(AppError::NotFound("the bundled scrcpy".into()));
+        };
+        let title = inner.jobs.iter().find(|j| j.id == id).map(|j| format!("J{id} {} (view only)", j.scenario)).unwrap_or_default();
+        let mut cmd = Command::new(&scrcpy);
+        // --display-id mirrors an existing display; the session's cleanup never ends it
+        // (it has no new_display argument), and closing it never ends the session.
+        cmd.args(["-s", &serial])
+            .arg(format!("--display-id={display}"))
+            .args(["--no-control", "--no-audio", "--no-clipboard-autosync"])
+            .arg(format!("--window-title={title}"))
+            .env("ADB", &adb)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(d) = scrcpy.parent() {
+            cmd.current_dir(d);
+        }
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        let mut child = cmd.spawn().map_err(|e| AppError::Io(format!("could not start scrcpy: {e}")))?;
+        if !crate::workers::adopt(&child) {
+            crate::emulator::kill_tree(&mut child);
+            return Err(AppError::Io("could not tie the window to the app".into()));
+        }
+        audit(&inner, "watch", Some(id), None, &format!("view-only window on {serial} display {display}"));
+        inner.watchers.insert(id, child);
+        Ok(())
     }
 
     /// The agent's readable trace (its calls, answers and words), newest last.
@@ -615,17 +970,18 @@ impl QaEngine {
             .jobs
             .iter()
             .filter(|j| j.status == Status::Queued)
-            .map(|j| Want { id: j.id, allowed: j.devices.clone(), agent: j.goal.is_some() })
+            .map(|j| Want { id: j.id, allowed: j.devices.clone(), session: j.goal.is_some() || settings.sessions.scripts, veronika: j.veronika, mode: j.mode })
             .collect();
         let slots = settings.max_parallel.saturating_sub(inner.children.len());
         let sessions = &settings.sessions;
         let mut opening = Vec::new();
-        for (id, serial, slot) in assign(&queued, &ready, &inner.leases, slots, sessions.per_phone(), sessions.physical_first) {
+        for (id, phone, slot) in assign(&queued, &ready, &inner.leases, slots, sessions.per_phone(), sessions.physical_first) {
+            let place = Place { serial: transport(&inner.leases, &ready, &phone), phone, slot };
             match slot {
-                Slot::Whole => start(&mut inner, &settings, id, serial, slot, None),
+                Slot::Whole => start(&mut inner, &settings, id, place, None),
                 Slot::Session(_) => {
-                    if reserve(&mut inner, &settings, id, &serial, slot) {
-                        opening.push((id, serial, slot));
+                    if reserve(&mut inner, &settings, id, &place) {
+                        opening.push((id, place));
                     }
                 }
             }
@@ -633,20 +989,21 @@ impl QaEngine {
         drop(inner);
         // Opening a display takes seconds (scrcpy, then the app); do it outside the lock, in
         // order, so session 2 finds session 1's display.
-        for (id, serial, slot) in opening {
-            self.open_session(&settings, id, serial, slot);
+        for (id, place) in opening {
+            self.open_session(&settings, id, place);
         }
         true
     }
 
-    fn open_session(&self, settings: &Settings, id: u32, serial: String, slot: Slot) {
+    fn open_session(&self, settings: &Settings, id: u32, place: Place) {
+        let (serial, slot) = (place.serial.clone(), place.slot);
         let (dir, sibling) = {
             let inner = self.inner.lock().unwrap();
             let dir = inner.jobs.iter().find(|j| j.id == id).and_then(|j| j.evidence_dir.clone()).unwrap_or_default();
             let sibling = inner
                 .leases
                 .values()
-                .find(|l| l.serial == serial && l.slot == Some(1) && l.job_id != id)
+                .find(|l| l.phone == place.phone && l.slot == Some(1) && l.job_id != id)
                 .and_then(|l| inner.sessions.get(&l.job_id))
                 .map(|s| s.display);
             (PathBuf::from(dir), sibling)
@@ -662,7 +1019,7 @@ impl QaEngine {
             Ok(session) if still => {
                 let display = session.display;
                 inner.sessions.insert(id, session);
-                start(&mut inner, settings, id, serial, slot, Some(display));
+                start(&mut inner, settings, id, place, Some(display));
             }
             Ok(session) => {
                 std::thread::spawn(move || session.close());
@@ -726,36 +1083,61 @@ fn reap(inner: &mut Inner, settings: &Settings) {
 
 /// A leased device missing from two device checks in a row (about 10 s) is gone: its job
 /// ends as an infrastructure error and the lease is released.
-fn drop_disconnected(inner: &mut Inner, ready: &[String]) {
-    let leased: Vec<(String, u32)> = inner.leases.values().map(|l| (l.serial.clone(), l.job_id)).collect();
-    inner.missing.retain(|s, _| leased.iter().any(|(l, _)| l == s));
-    for (serial, id) in leased {
-        if ready.contains(&serial) {
-            inner.missing.remove(&serial);
+///
+/// It is the lease's own serial that counts: a session over USB ends when the cable is pulled,
+/// even while the phone is still reachable over wireless debugging.
+fn drop_disconnected(inner: &mut Inner, ready: &[Phone]) {
+    let leased: Vec<(String, String, u32)> = inner.leases.iter().map(|(k, l)| (k.clone(), l.serial.clone(), l.job_id)).collect();
+    inner.missing.retain(|k, _| leased.iter().any(|(l, _, _)| l == k));
+    for (key, serial, id) in leased {
+        if ready.iter().any(|p| p.serials.contains(&serial)) {
+            inner.missing.remove(&key);
             continue;
         }
-        let n = inner.missing.entry(serial.clone()).or_insert(0);
+        let n = inner.missing.entry(key.clone()).or_insert(0);
         *n += 1;
         if *n >= 2 {
-            inner.missing.remove(&serial);
+            inner.missing.remove(&key);
             kill(inner, id);
             finish(inner, id, Status::Error, None, Some(format!("device {serial} disconnected")));
         }
     }
 }
 
+/// Where a job runs: a phone, the serial it reaches the phone by, and the slot on it.
+#[derive(Debug, Clone)]
+struct Place {
+    phone: String,
+    serial: String,
+    slot: Slot,
+}
+
+/// The serial a new job on `phone` uses: the one its other session already uses (session 2
+/// opens beside session 1, through the same adb connection), else USB when it is plugged in.
+fn transport(leases: &HashMap<String, Lease>, ready: &[Phone], phone: &str) -> String {
+    leases
+        .values()
+        .find(|l| l.phone == phone)
+        .map(|l| l.serial.clone())
+        .or_else(|| ready.iter().find(|p| p.id == phone).and_then(|p| p.serials.first().cloned()))
+        .unwrap_or_else(|| phone.to_string())
+}
+
 /// Mark the job running and lease its place before anything slow happens, so no other job
 /// gets the same place. Returns false (the job then ended as an error) when its evidence
 /// folder cannot be made.
-fn reserve(inner: &mut Inner, settings: &Settings, id: u32, serial: &str, slot: Slot) -> bool {
+fn reserve(inner: &mut Inner, settings: &Settings, id: u32, place: &Place) -> bool {
+    let (serial, slot) = (place.serial.as_str(), place.slot);
     let Some(job) = inner.jobs.iter_mut().find(|j| j.id == id) else { return false };
-    let dir = settings.artifacts.join(&job.run_id).join(slug(serial)).join(format!("J{}-{}", job.id, slug(&job.scenario)));
+    let dir = settings.artifacts.join(&job.run_id).join(slug(&place.phone)).join(format!("J{}-{}", job.id, slug(&job.scenario)));
     job.serial = Some(serial.to_string());
     job.evidence_dir = Some(dir.to_string_lossy().to_string());
     job.started_at = Some(now());
     job.status = Status::Running;
     let lease = Lease {
+        phone: place.phone.clone(),
         serial: serial.to_string(),
+        veronika: job.veronika,
         slot: match slot {
             Slot::Whole => None,
             Slot::Session(n) => Some(n),
@@ -764,7 +1146,7 @@ fn reserve(inner: &mut Inner, settings: &Settings, id: u32, serial: &str, slot: 
         run_id: job.run_id.clone(),
         acquired_at: now(),
     };
-    inner.leases.insert(lease_key(serial, slot), lease);
+    inner.leases.insert(lease_key(&place.phone, slot), lease);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         finish(inner, id, Status::Error, None, Some(format!("could not make the evidence folder: {e}")));
         return false;
@@ -774,10 +1156,11 @@ fn reserve(inner: &mut Inner, settings: &Settings, id: u32, serial: &str, slot: 
 
 /// Spawn the job's worker on its leased place. A spawn failure ends the job as an error.
 /// `display` is the job's session display, already open (the place was reserved then).
-fn start(inner: &mut Inner, settings: &Settings, id: u32, serial: String, slot: Slot, display: Option<u32>) {
-    if display.is_none() && !reserve(inner, settings, id, &serial, slot) {
+fn start(inner: &mut Inner, settings: &Settings, id: u32, place: Place, display: Option<u32>) {
+    if display.is_none() && !reserve(inner, settings, id, &place) {
         return;
     }
+    let serial = place.serial;
     let Some(job) = inner.jobs.iter_mut().find(|j| j.id == id) else { return };
     job.display = display;
     let dir = PathBuf::from(job.evidence_dir.clone().unwrap_or_default());
@@ -884,6 +1267,9 @@ fn record_trace(out: impl std::io::Read, mut trace: std::fs::File, guard: &Guard
 fn finish(inner: &mut Inner, id: u32, status: Status, code: Option<i32>, note: Option<String>) {
     inner.leases.retain(|_, l| l.job_id != id);
     inner.meters.remove(&id);
+    if let Some(mut w) = inner.watchers.remove(&id) {
+        crate::emulator::kill_tree(&mut w);
+    }
     if let Some(session) = inner.sessions.remove(&id) {
         // A few adb calls and up to 6 s for scrcpy to finish the recording: off the lock.
         std::thread::spawn(move || session.close());
@@ -902,7 +1288,8 @@ fn finish(inner: &mut Inner, id: u32, status: Status, code: Option<i32>, note: O
     let run: Vec<&Job> = inner.jobs.iter().filter(|j| j.run_id == run_id).collect();
     if run.iter().all(|j| j.status.is_final()) {
         if let Some(settings) = &inner.settings {
-            let _ = write_summary(&settings.artifacts, &run_id, &run);
+            let merged = merge_groups(&settings.artifacts.join(&run_id), &run);
+            let _ = write_summary(&settings.artifacts, &run_id, &run, &merged);
             let run: Vec<Job> = run.into_iter().cloned().collect();
             let _ = crate::defects::export(&settings.artifacts, &run_id, &run, &inner.jobs);
         }
@@ -921,9 +1308,101 @@ fn audit(inner: &Inner, kind: &str, job_id: Option<u32>, run_id: Option<&str>, d
     }
 }
 
+/// For every test set split across jobs, one bundle of all its cases:
+/// `<run>/merged-<group>/run.json`. Returns (group, folder) for each one written.
+fn merge_groups(run_dir: &Path, run: &[&Job]) -> Vec<(String, PathBuf)> {
+    let mut groups: Vec<&str> = run.iter().filter_map(|j| j.group.as_deref()).collect();
+    groups.dedup();
+    let mut out = Vec::new();
+    for group in groups {
+        let shards: Vec<(&Job, Option<serde_json::Value>)> = run
+            .iter()
+            .filter(|j| j.group.as_deref() == Some(group))
+            .map(|j| {
+                let bundle = j.evidence_dir.as_ref().and_then(|d| std::fs::read_to_string(Path::new(d).join("run.json")).ok());
+                (*j, bundle.and_then(|t| serde_json::from_str(&t).ok()))
+            })
+            .collect();
+        if shards.len() < 2 || shards.iter().all(|(_, b)| b.is_none()) {
+            continue;
+        }
+        let dir = run_dir.join(format!("merged-{}", slug(group)));
+        let merged = merge_bundles(run_dir, group, &shards);
+        let written = std::fs::create_dir_all(&dir)
+            .and_then(|_| std::fs::write(dir.join("run.json"), serde_json::to_string_pretty(&merged).unwrap_or_default()));
+        if written.is_ok() {
+            out.push((group.to_string(), dir));
+        }
+    }
+    out
+}
+
+/// One bundle from a split test set's job bundles. Cases keep their evidence where their job
+/// wrote it: their `evidence/`, `video/` and `logs/` paths point into that job's folder.
+/// Two jobs on one phone read the same crash log, so crash lines are counted once.
+fn merge_bundles(run_dir: &Path, group: &str, shards: &[(&Job, Option<serde_json::Value>)]) -> serde_json::Value {
+    use serde_json::{json, Value};
+    let mut base = shards.iter().find_map(|(_, b)| b.clone()).unwrap_or_else(|| json!({}));
+    let (mut cases, mut lines, mut info) = (Vec::new(), Vec::<Value>::new(), Vec::new());
+    let (mut fatal, mut anr) = (0, 0);
+    let (mut started, mut finished): (Option<String>, Option<String>) = (None, None);
+    for (job, bundle) in shards {
+        let dir = PathBuf::from(job.evidence_dir.clone().unwrap_or_default());
+        let rel = dir.strip_prefix(run_dir).map(|r| format!("../{}/", r.to_string_lossy().replace('\\', "/"))).unwrap_or_default();
+        info.push(json!({
+            "job": job.id,
+            "only": job.only,
+            "serial": job.serial,
+            "display": job.display,
+            "status": job.status.as_str(),
+            "dir": dir,
+            "recording": job.display.map(|_| dir.join("session.mkv")),
+            "bundle": bundle.is_some(),
+        }));
+        let Some(b) = bundle else { continue };
+        for c in b["cases"].as_array().into_iter().flatten() {
+            let mut c = c.clone();
+            rebase(&mut c, &rel);
+            cases.push(c);
+        }
+        let st = &b["stability"];
+        fatal = fatal.max(st["fatal"].as_u64().unwrap_or(0));
+        anr = anr.max(st["anr"].as_u64().unwrap_or(0));
+        for l in st["lines"].as_array().into_iter().flatten() {
+            if !lines.contains(l) {
+                lines.push(l.clone());
+            }
+        }
+        if let Some(t) = b["started"].as_str() {
+            started = Some(started.map_or(t.to_string(), |s| s.min(t.to_string())));
+        }
+        if let Some(t) = b["finished"].as_str() {
+            finished = Some(finished.map_or(t.to_string(), |s| s.max(t.to_string())));
+        }
+    }
+    cases.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    let count = |what: &str| lines.iter().filter(|l| l.as_str().is_some_and(|l| l.contains(what))).count() as u64;
+    base["run_id"] = json!(group);
+    base["cases"] = Value::Array(cases);
+    base["stability"] = json!({ "fatal": fatal.max(count("FATAL EXCEPTION")), "anr": anr.max(count("ANR in ")), "lines": lines });
+    base["started"] = json!(started);
+    base["finished"] = json!(finished);
+    base["shards"] = Value::Array(info);
+    base
+}
+
+fn rebase(v: &mut serde_json::Value, rel: &str) {
+    match v {
+        serde_json::Value::String(s) if ["evidence/", "video/", "logs/"].iter().any(|p| s.starts_with(p)) => *s = format!("{rel}{s}"),
+        serde_json::Value::Array(a) => a.iter_mut().for_each(|x| rebase(x, rel)),
+        serde_json::Value::Object(o) => o.values_mut().for_each(|x| rebase(x, rel)),
+        _ => {}
+    }
+}
+
 /// `<artifacts>/<run_id>/reports/summary.json`: every job with its device, scenario,
-/// verdict and evidence directory.
-fn write_summary(artifacts: &Path, run_id: &str, jobs: &[&Job]) -> std::io::Result<()> {
+/// verdict and evidence directory, and the merged bundle of each split test set.
+fn write_summary(artifacts: &Path, run_id: &str, jobs: &[&Job], merged: &[(String, PathBuf)]) -> std::io::Result<()> {
     let count = |s: Status| jobs.iter().filter(|j| j.status == s).count();
     let summary = serde_json::json!({
         "runId": run_id,
@@ -937,6 +1416,7 @@ fn write_summary(artifacts: &Path, run_id: &str, jobs: &[&Job]) -> std::io::Resu
             "cancelled": count(Status::Cancelled),
         },
         "jobs": jobs,
+        "merged": merged.iter().map(|(group, dir)| serde_json::json!({ "group": group, "dir": dir })).collect::<Vec<_>>(),
     });
     let dir = artifacts.join(run_id).join("reports");
     std::fs::create_dir_all(&dir)?;
@@ -948,7 +1428,11 @@ mod tests {
     use super::*;
 
     fn lease(serial: &str, job_id: u32) -> (String, Lease) {
-        (serial.into(), Lease { serial: serial.into(), slot: None, job_id, run_id: "R".into(), acquired_at: 0 })
+        (serial.into(), Lease { phone: serial.into(), serial: serial.into(), veronika: false, slot: None, job_id, run_id: "R".into(), acquired_at: 0 })
+    }
+
+    fn phones(serials: &[&str]) -> Vec<Phone> {
+        serials.iter().map(|s| Phone::one(s)).collect()
     }
 
     #[test]
@@ -974,20 +1458,27 @@ mod tests {
     }
 
     /// Scripted jobs with sessions off: the scheduler as it was before sessions.
-    fn plain(queued: &[(u32, Vec<String>)], ready: &[String], leased: &HashMap<String, Lease>, slots: usize) -> Vec<(u32, String)> {
-        let wants: Vec<Want> = queued.iter().map(|(id, allowed)| Want { id: *id, allowed: allowed.clone(), agent: false }).collect();
+    fn plain(queued: &[(u32, Vec<String>)], ready: &[Phone], leased: &HashMap<String, Lease>, slots: usize) -> Vec<(u32, String)> {
+        let wants: Vec<Want> = queued.iter().map(|(id, allowed)| Want { id: *id, allowed: allowed.clone(), ..script(*id) }).collect();
         assign(&wants, ready, leased, slots, 0, false).into_iter().map(|(id, s, slot)| {
             assert_eq!(slot, Slot::Whole);
             (id, s)
         }).collect()
     }
 
+    /// An AI job: it may open Veronika.
     fn ai(id: u32) -> Want {
-        Want { id, allowed: vec![], agent: true }
+        Want { id, allowed: vec![], session: true, veronika: true, mode: Mode::Auto }
     }
 
+    /// A scripted job on native screens (search, home), with a session-aware run.py.
+    fn native(id: u32) -> Want {
+        Want { veronika: false, ..ai(id) }
+    }
+
+    /// A scripted job with a run.py that restarts the app: it needs the whole phone.
     fn script(id: u32) -> Want {
-        Want { id, allowed: vec![], agent: false }
+        Want { session: false, veronika: false, ..ai(id) }
     }
 
     fn held(places: &[(&str, Option<u8>, u32)]) -> HashMap<String, Lease> {
@@ -995,18 +1486,18 @@ mod tests {
             .iter()
             .map(|(serial, slot, job_id)| {
                 let key = lease_key(serial, slot.map_or(Slot::Whole, Slot::Session));
-                (key, Lease { serial: serial.to_string(), slot: *slot, job_id: *job_id, run_id: "R".into(), acquired_at: 0 })
+                (key, Lease { phone: serial.to_string(), serial: serial.to_string(), veronika: false, slot: *slot, job_id: *job_id, run_id: "R".into(), acquired_at: 0 })
             })
             .collect()
     }
 
     #[test]
     fn one_phone_runs_two_ai_sessions_and_scripts_wait_for_the_whole_phone() {
-        let ready = vec!["phone".to_string()];
+        let ready = phones(&["phone"]);
         let none = HashMap::new();
-        // Two AI jobs share the phone: session 1, then session 2 beside it.
+        // Two jobs share the phone: session 1, then session 2 beside it.
         assert_eq!(
-            assign(&[ai(1), ai(2), ai(3)], &ready, &none, 5, 2, true),
+            assign(&[native(1), ai(2), native(3)], &ready, &none, 5, 2, true),
             vec![(1, "phone".into(), Slot::Session(1)), (2, "phone".into(), Slot::Session(2))]
         );
         // A scripted job needs the whole phone, so it waits while any session runs.
@@ -1016,19 +1507,19 @@ mod tests {
         // app); a free session 2 next to a running session 1 is refilled.
         assert!(assign(&[ai(4)], &ready, &held(&[("phone", Some(2), 7)]), 5, 2, true).is_empty());
         assert_eq!(assign(&[ai(4)], &ready, &held(&[("phone", Some(1), 7)]), 5, 2, true), vec![(4, "phone".into(), Slot::Session(2))]);
-        // One session per phone, or sessions off: AI jobs take the whole phone one at a time.
-        assert_eq!(assign(&[ai(1), ai(2)], &ready, &none, 5, 1, true), vec![(1, "phone".into(), Slot::Session(1))]);
-        assert_eq!(assign(&[ai(1), ai(2)], &ready, &none, 5, 0, true), vec![(1, "phone".into(), Slot::Whole)]);
+        // One session per phone, or sessions off: jobs take the phone one at a time.
+        assert_eq!(assign(&[native(1), native(2)], &ready, &none, 5, 1, true), vec![(1, "phone".into(), Slot::Session(1))]);
+        assert_eq!(assign(&[native(1), native(2)], &ready, &none, 5, 0, true), vec![(1, "phone".into(), Slot::Whole)]);
         // The parallel limit still counts every session.
-        assert_eq!(assign(&[ai(1), ai(2)], &ready, &none, 1, 2, true).len(), 1);
+        assert_eq!(assign(&[native(1), native(2)], &ready, &none, 1, 2, true).len(), 1);
     }
 
     #[test]
     fn physical_phones_come_before_emulators_and_emulators_get_no_sessions() {
-        let ready = vec!["emulator-5554".to_string(), "phone".to_string()];
+        let ready = phones(&["emulator-5554", "phone"]);
         let none = HashMap::new();
         assert_eq!(
-            assign(&[ai(1), ai(2), ai(3)], &ready, &none, 5, 2, true),
+            assign(&[native(1), native(2), native(3)], &ready, &none, 5, 2, true),
             vec![(1, "phone".into(), Slot::Session(1)), (2, "phone".into(), Slot::Session(2)), (3, "emulator-5554".into(), Slot::Whole)]
         );
         assert_eq!(assign(&[script(1)], &ready, &none, 5, 2, true), vec![(1, "phone".into(), Slot::Whole)]);
@@ -1037,7 +1528,7 @@ mod tests {
 
     #[test]
     fn assign_skips_leased_devices_and_respects_slots() {
-        let ready = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let ready = phones(&["a", "b", "c"]);
         let leased: HashMap<String, Lease> = [lease("a", 9)].into();
         let any = |ids: &[u32]| ids.iter().map(|i| (*i, Vec::new())).collect::<Vec<_>>();
         assert_eq!(plain(&any(&[1, 2, 3]), &ready, &leased, 5), vec![(1, "b".into()), (2, "c".into())]);
@@ -1047,7 +1538,7 @@ mod tests {
 
     #[test]
     fn assign_keeps_pinned_jobs_on_their_devices() {
-        let ready = vec!["a".to_string(), "b".to_string()];
+        let ready = phones(&["a", "b"]);
         let none: HashMap<String, Lease> = HashMap::new();
         let on = |s: &str| vec![s.to_string()];
         // Two jobs pinned to "b": the first takes it, the second waits; the unpinned job
@@ -1087,10 +1578,11 @@ mod tests {
 
     /// A stand-in worker: sleeps, then exits with the code named by its "test set" argument.
     fn fake(artifacts: &Path, devices: &[&str], max_parallel: usize, timeout: u64) -> Settings {
-        let devices: Vec<String> = devices.iter().map(|s| s.to_string()).collect();
+        let devices = phones(devices);
         let script = "import sys,time; time.sleep(1.5); print('worker', sys.argv[1:]); sys.exit(int(sys.argv[1]))";
         Settings {
             runner: Runner { program: "python".into(), args: vec!["-c".into(), script.into()], adb_dir: None },
+            cases: Arc::new(|_, _| None),
             artifacts: artifacts.to_path_buf(),
             max_parallel,
             timeout: Duration::from_secs(timeout),
@@ -1298,7 +1790,7 @@ elif mode == "loop":
         let attached = Arc::new(Mutex::new(vec!["usb-1".to_string()]));
         let mut settings = fake(out.path(), &[], 1, 120);
         let seen = attached.clone();
-        settings.devices = Arc::new(move || seen.lock().unwrap().clone());
+        settings.devices = Arc::new(move || seen.lock().unwrap().iter().map(|s| Phone::one(s)).collect());
         settings.runner.args = vec!["-c".into(), "import time; time.sleep(60)".into()];
         let engine = QaEngine::new();
         engine.submit_with(settings, scenarios(&["0"])).unwrap();
@@ -1313,6 +1805,173 @@ elif mode == "loop":
         assert_eq!(state.jobs[0].status, Status::Error);
         assert!(state.jobs[0].note.as_deref().unwrap().contains("disconnected"));
         assert!(state.leases.is_empty());
+    }
+
+    #[test]
+    fn one_phone_on_usb_and_wireless_is_one_place_reached_over_usb() {
+        let wifi = "adb-PIX1-abc._adb-tls-connect._tcp";
+        let ready = group_phones([(wifi.to_string(), "PIX1".to_string()), ("PIX1".to_string(), "PIX1".to_string()), ("emulator-5554".to_string(), "emulator-5554".to_string())]);
+        assert_eq!(ready, vec![Phone { id: "PIX1".into(), serials: vec!["PIX1".into(), wifi.into()] }, Phone::one("emulator-5554")]);
+        let none = HashMap::new();
+        // Two scripted jobs: one on the phone, one on the emulator, never two on the phone.
+        assert_eq!(assign(&[script(1), script(2), script(3)], &ready, &none, 5, 0, true), vec![(1, "PIX1".into(), Slot::Whole), (2, "emulator-5554".into(), Slot::Whole)]);
+        // A job pinned to the phone's wireless serial runs on that phone; new jobs go over USB.
+        let pinned = Want { allowed: vec![wifi.into()], ..script(4) };
+        assert_eq!(assign(&[pinned], &ready, &none, 5, 0, true), vec![(4, "PIX1".into(), Slot::Whole)]);
+        assert_eq!(transport(&none, &ready, "PIX1"), "PIX1");
+        // Session 2 uses the connection session 1 already uses.
+        let mut s1 = held(&[("PIX1", Some(1), 7)]);
+        s1.values_mut().for_each(|l| l.serial = wifi.into());
+        assert_eq!(transport(&s1, &ready, "PIX1"), wifi);
+    }
+
+    #[test]
+    fn a_session_ends_when_its_own_connection_goes_even_if_the_phone_is_still_reachable() {
+        let mut inner = Inner::default();
+        inner.jobs.push(Job { id: 7, status: Status::Running, ..job() });
+        inner.leases = held(&[("PIX1", Some(1), 7)]);
+        let still = vec![Phone { id: "PIX1".into(), serials: vec!["wifi-serial".into()] }];
+        drop_disconnected(&mut inner, &still);
+        assert_eq!(inner.jobs[0].status, Status::Running, "one missed check is not enough");
+        drop_disconnected(&mut inner, &still);
+        assert_eq!(inner.jobs[0].status, Status::Error);
+        assert!(inner.leases.is_empty());
+    }
+
+    #[test]
+    fn veronika_jobs_never_share_a_phone_and_modes_pick_the_screen_or_a_session() {
+        let ready = phones(&["emulator-5554", "phone"]);
+        let none = HashMap::new();
+        // Two AI jobs: the phone has one Veronika, so the second goes to the emulator.
+        assert_eq!(assign(&[ai(1), ai(2)], &ready, &none, 5, 2, true), vec![(1, "phone".into(), Slot::Session(1)), (2, "emulator-5554".into(), Slot::Whole)]);
+        // A native job pairs with a running Veronika job.
+        let mut chat = held(&[("phone", Some(1), 7)]);
+        chat.values_mut().for_each(|l| l.veronika = true);
+        assert_eq!(assign(&[ai(1), native(2)], &phones(&["phone"]), &chat, 5, 2, true), vec![(2, "phone".into(), Slot::Session(2))]);
+        // Screen: the phone's own screen, one job at a time.
+        let screen = |id| Want { mode: Mode::Screen, ..native(id) };
+        assert_eq!(assign(&[screen(1), screen(2)], &phones(&["phone"]), &none, 5, 2, true), vec![(1, "phone".into(), Slot::Whole)]);
+        // Hidden: sessions only, so never an emulator and never with sessions off.
+        let hidden = |id| Want { mode: Mode::Hidden, ..native(id) };
+        assert_eq!(assign(&[hidden(1), hidden(2), hidden(3)], &ready, &none, 5, 2, true), vec![(1, "phone".into(), Slot::Session(1)), (2, "phone".into(), Slot::Session(2))]);
+        assert!(assign(&[hidden(1)], &ready, &none, 5, 0, true).is_empty());
+    }
+
+    fn case(id: &str, surface: &str, repeat: u32, follows: Option<&str>) -> CaseInfo {
+        CaseInfo { id: id.into(), surface: surface.into(), repeat, follows: follows.map(str::to_string) }
+    }
+
+    #[test]
+    fn list_lines_are_parsed_with_their_follow_up_parent() {
+        let text = "FUP-A1     m2 veronika       scenario     x1  Apa itu roaming?\n\
+FUP-A2     m2 veronika       scenario     x1  <- FUP-A1  Berapa harganya?\n\
+REC-01     m2 search         scenario     x3  roaming\n\
+M1 sample: 2 of 5 m1 cases, seed 7\n3 case(s), 5 run(s)\n";
+        assert_eq!(parse_list(text), vec![
+            case("FUP-A1", "veronika", 1, None),
+            case("FUP-A2", "veronika", 1, Some("FUP-A1")),
+            case("REC-01", "search", 3, None),
+        ]);
+    }
+
+    #[test]
+    fn shards_keep_chains_whole_balance_runs_and_keep_veronika_to_one_job_per_phone() {
+        let cases = vec![
+            case("V1", "veronika", 1, None),
+            case("V2", "veronika", 1, Some("V1")),
+            case("V3", "veronika", 2, None),
+            case("S1", "search", 3, None),
+            case("S2", "search", 1, None),
+            case("S3", "search-suggest", 2, None),
+        ];
+        // One phone, two sessions: one Veronika job (its whole chain in order) and one native job.
+        assert_eq!(shard(&cases, 1, 2), vec![
+            (vec!["V1".into(), "V2".into(), "V3".into()], true),
+            (vec!["S1".into(), "S2".into(), "S3".into()], false),
+        ]);
+        // Two phones with two sessions each: two of each, balanced by runs (S1=3 | S3+S2=3).
+        assert_eq!(shard(&cases, 2, 4), vec![
+            (vec!["V1".into(), "V2".into()], true),
+            (vec!["V3".into()], true),
+            (vec!["S1".into()], false),
+            (vec!["S2".into(), "S3".into()], false),
+        ]);
+        // Only native cases: every place gets work.
+        assert_eq!(shard(&cases[3..], 1, 2).len(), 2);
+    }
+
+    #[test]
+    fn split_runs_merge_into_one_bundle_that_points_at_each_jobs_evidence() {
+        let run = Path::new("A").join("RUN-1");
+        let at = |id, dir: &str, display| Job { id, evidence_dir: Some(run.join("PIX1").join(dir).to_string_lossy().to_string()), display, status: Status::Passed, ..job() };
+        let (j1, j2) = (at(1, "J1-x", Some(20)), at(2, "J2-x", Some(21)));
+        let crash = "E/AndroidRuntime: FATAL EXCEPTION: main";
+        let b1 = serde_json::json!({"started": "T2", "finished": "T5", "cases": [{"id": "S2", "runs": [{"evidence": [{"file": "evidence/E-S2-1.txt"}]}]}],
+            "stability": {"fatal": 1, "anr": 0, "lines": [crash]}});
+        let b2 = serde_json::json!({"started": "T1", "finished": "T4", "cases": [{"id": "S1", "runs": [{"recording": {"files": ["video/S1-1.mp4"]}}]}],
+            "stability": {"fatal": 1, "anr": 0, "lines": [crash]}});
+        let m = merge_bundles(&run, "set-1", &[(&j1, Some(b1)), (&j2, Some(b2))]);
+        assert_eq!(m["cases"][0]["id"], "S1");
+        assert_eq!(m["cases"][0]["runs"][0]["recording"]["files"][0], "../PIX1/J2-x/video/S1-1.mp4");
+        assert_eq!(m["cases"][1]["runs"][0]["evidence"][0]["file"], "../PIX1/J1-x/evidence/E-S2-1.txt");
+        assert_eq!(m["stability"]["fatal"], 1, "the same crash read by both sessions counts once");
+        assert_eq!((m["started"].as_str(), m["finished"].as_str()), (Some("T1"), Some("T5")));
+        assert_eq!(m["shards"].as_array().unwrap().len(), 2);
+        assert!(m["shards"][0]["recording"].as_str().unwrap().ends_with("session.mkv"));
+    }
+
+    #[test]
+    fn a_whole_test_set_is_split_across_free_places_and_merged_when_the_run_ends() {
+        let out = tempfile::tempdir().unwrap();
+        let mut settings = fake(out.path(), &["dev-a", "dev-b"], 2, 60);
+        settings.cases = Arc::new(|_, _| Some(vec![case("S1", "search", 1, None), case("S2", "search", 1, None), case("V1", "veronika", 1, None)]));
+        // The stand-in worker writes a bundle with the cases it was given.
+        settings.runner.args = vec!["-c".into(), "import sys,json,time; time.sleep(1); ids=sys.argv[sys.argv.index('--only')+1].split(','); \
+open('run.json','w').write(json.dumps({'cases':[{'id':i,'verdict':'pass'} for i in ids],'stability':{'fatal':0,'anr':0,'lines':[]}}))".into()];
+        let engine = QaEngine::new();
+        let run = engine.submit_with(settings, vec![Scenario { testset: "C:/sets/mixed.yaml".into(), ..Default::default() }]).unwrap();
+        let state = wait_done(&engine, |_| {});
+        let labels: Vec<&str> = state.jobs.iter().map(|j| j.scenario.as_str()).collect();
+        assert_eq!(labels, vec!["mixed [1/2]", "mixed [2/2]"]);
+        assert_eq!(state.jobs.iter().map(|j| (j.only.clone().unwrap(), j.veronika)).collect::<Vec<_>>(), vec![("V1".into(), true), ("S1,S2".into(), false)]);
+        let merged: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out.path().join(&run).join("merged-mixed-1").join("run.json")).unwrap()).unwrap();
+        let ids: Vec<&str> = merged["cases"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["S1", "S2", "V1"]);
+        let summary = std::fs::read_to_string(out.path().join(&run).join("reports").join("summary.json")).unwrap();
+        assert!(summary.contains("merged-mixed-1"));
+    }
+
+    #[test]
+    fn a_hidden_run_is_refused_when_sessions_are_off() {
+        let out = tempfile::tempdir().unwrap();
+        let err = QaEngine::new().submit_with(fake(out.path(), &["p"], 1, 60), vec![Scenario { testset: "0".into(), mode: Mode::Hidden, ..Default::default() }]);
+        assert!(err.is_err());
+    }
+
+    fn job() -> Job {
+        Job {
+            id: 0,
+            run_id: "R".into(),
+            scenario: "s".into(),
+            testset: "t".into(),
+            only: None,
+            kind: "script".into(),
+            goal: None,
+            devices: vec![],
+            actions: 0,
+            status: Status::Queued,
+            serial: None,
+            display: None,
+            mode: Mode::Auto,
+            veronika: false,
+            group: None,
+            evidence_dir: None,
+            exit_code: None,
+            note: None,
+            queued_at: 0,
+            started_at: None,
+            finished_at: None,
+        }
     }
 
     /// Phase 2 acceptance against real emulators and the real QA skill.
@@ -1390,11 +2049,12 @@ elif mode == "loop":
     }
 
     /// The QA skill on whatever phones are connected (no emulators): jobs share the devices,
-    /// one at a time each. Same environment variables as the emulator test above.
+    /// with sessions when `AQAOS_ADB` is the bundled adb (scrcpy next to it). Same environment
+    /// variables as the emulator test above; an `AQAOS_E2E` item without `:ids` is a whole set.
     #[test]
     #[ignore = "runs the QA skill on the connected phones"]
     fn skill_run_on_connected_devices() {
-        let adb = crate::emulator::locate_sdk().and_then(|s| s.adb).expect("platform-tools adb");
+        let adb = std::env::var("AQAOS_ADB").map(PathBuf::from).ok().or_else(|| crate::emulator::locate_sdk().and_then(|s| s.adb)).expect("adb");
         let devices = ready_devices(&adb);
         assert!(!devices.is_empty(), "connect a phone with USB debugging on");
         let out = std::env::temp_dir().join(format!("aqaos-phone-{}", now()));
@@ -1423,21 +2083,26 @@ elif mode == "loop":
             state = engine.state();
             let running: Vec<&Job> = state.jobs.iter().filter(|j| j.status == Status::Running).collect();
             peak = peak.max(running.len());
-            let serials: std::collections::HashSet<_> = running.iter().map(|j| j.serial.clone()).collect();
-            assert_eq!(serials.len(), running.len(), "a device was given to two workers");
+            // A session job has its display once it opens; until then only its lease marks the place.
+            let shown: Vec<_> = running.iter().filter_map(|j| j.display.map(|d| (j.serial.clone(), d))).collect();
+            let places: std::collections::HashSet<_> = shown.iter().cloned().collect();
+            assert_eq!(places.len(), shown.len(), "a display was given to two workers");
+            for l in state.leases.iter().filter(|l| l.slot.is_none()) {
+                assert_eq!(state.leases.iter().filter(|o| o.phone == l.phone).count(), 1, "a whole phone was shared");
+            }
             if state.jobs.iter().all(|j| j.status.is_final()) {
                 break;
             }
             std::thread::sleep(Duration::from_secs(1));
         }
         for j in &state.jobs {
-            println!("J{} {} on {:?}: {:?} exit {:?} {:?}", j.id, j.scenario, j.serial, j.status, j.exit_code, j.note);
+            println!("J{} {} on {:?} display {:?} only {:?}: {:?} exit {:?} {:?}", j.id, j.scenario, j.serial, j.display, j.only, j.status, j.exit_code, j.note);
             println!("  evidence: {:?}", j.evidence_dir);
             println!("{}", engine.log_tail(j.id, 10).unwrap());
         }
         println!("devices {devices:?}, peak parallel {peak}");
         println!("summary: {}", out.join(&run).join("reports").join("summary.json").display());
         assert!(state.jobs.iter().all(|j| j.status.is_final()), "jobs finished");
-        assert!(peak <= devices.len(), "never more workers than devices");
+        assert!(peak <= devices.len() * 2, "never more workers than places");
     }
 }

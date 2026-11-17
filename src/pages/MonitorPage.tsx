@@ -16,17 +16,20 @@ import {
 import { useConfig } from "../state/config";
 import { useSessions } from "../state/sessions";
 import { Button } from "../components/ui";
-import { JobFeed, StatusBadge, since, usePoll } from "../components/qa";
+import { JobFeed, SessionScreen, StatusBadge, since, usePoll } from "../components/qa";
 
 function DeviceCard({
   d,
   job,
+  sessions,
   leased,
   liveScreen,
   onError,
 }: {
   d: UsbDevice;
   job?: QaJob;
+  /** Jobs running on this device's hidden displays. */
+  sessions: QaJob[];
   leased: boolean;
   liveScreen: boolean;
   onError: (e: string) => void;
@@ -78,6 +81,13 @@ function DeviceCard({
                 front: {d.foreground.split("/")[0]}
               </span>
             )}
+          </div>
+        )}
+        {sessions.length > 0 && (
+          <div className="flex flex-wrap gap-2">
+            {sessions.map((s) => (
+              <SessionScreen key={s.id} job={s} onError={onError} />
+            ))}
           </div>
         )}
         {job ? (
@@ -185,6 +195,7 @@ export function MonitorPage() {
             key={d.serial}
             d={d}
             job={jobFor(d.serial)}
+            sessions={jobs.filter((j) => j.status === "running" && j.display != null && j.serial === d.serial)}
             leased={leases.some((l) => l.serial === d.serial)}
             liveScreen={liveScreen}
             onError={setError}

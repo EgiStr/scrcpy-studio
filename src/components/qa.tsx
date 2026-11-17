@@ -1,6 +1,6 @@
 // Pieces every QA view shares: the status badge, polling, run time and a job's live feed.
 import { useEffect, useRef, useState } from "react";
-import { qaLog, qaTrace, type QaJob, type QaStatus, type TraceEvent } from "../lib/ipc";
+import { errMessage, qaFrame, qaLog, qaTrace, qaWatch, type QaJob, type QaStatus, type TraceEvent } from "../lib/ipc";
 
 export const STATUS_BADGE: Record<QaStatus, string> = {
   queued: "bg-zinc-800 text-zinc-400",
@@ -27,6 +27,36 @@ export function since(secs?: number | null, until?: number | null) {
   if (!secs) return "";
   const d = Math.max(0, (until ?? Math.floor(Date.now() / 1000)) - secs);
   return `${Math.floor(d / 60)}m ${String(d % 60).padStart(2, "0")}s`;
+}
+
+/** A running job's hidden display: a screenshot every few seconds, and a view-only window on demand. */
+export function SessionScreen({ job, onError }: { job: QaJob; onError: (e: string) => void }) {
+  const [shot, setShot] = useState<string>();
+  const live = job.status === "running" && job.display != null;
+  usePoll(async () => setShot(await qaFrame(job.id)), 2500, live, [job.id]);
+  if (!live) return null;
+  return (
+    <div className="flex w-28 shrink-0 flex-col gap-1">
+      <div className="flex aspect-[9/20] items-center justify-center overflow-hidden rounded bg-black">
+        {shot ? (
+          <img src={shot} alt={`hidden display ${job.display} of J${job.id}`} className="h-full w-full object-contain" />
+        ) : (
+          <span className="text-[10px] text-zinc-500">loading…</span>
+        )}
+      </div>
+      <span className="font-mono text-[10px] text-zinc-500">
+        J{job.id} · display {job.display}
+      </span>
+      <button
+        type="button"
+        title="Open a window on this hidden display (view only; closing it leaves the test running)"
+        onClick={() => qaWatch(job.id).catch((e) => onError(errMessage(e)))}
+        className="rounded border border-zinc-700 px-2 py-0.5 text-[11px] text-zinc-300 hover:bg-zinc-800"
+      >
+        Watch
+      </button>
+    </div>
+  );
 }
 
 /** Poll `fn` every `ms` while `on`, never overlapping two calls. */

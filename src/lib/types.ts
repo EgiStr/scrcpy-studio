@@ -155,6 +155,8 @@ export interface Device {
   state: string;
   model?: string;
   isTcpip: boolean;
+  /** The phone behind the serial (the same over USB and wireless); set for online devices. */
+  phone?: string;
 }
 
 export interface Binaries {

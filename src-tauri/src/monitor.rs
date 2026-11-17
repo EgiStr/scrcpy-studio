@@ -98,7 +98,12 @@ pub fn usb_devices(adb: &Path) -> Result<Vec<UsbDevice>> {
 
 /// The screen as a `data:` URL, scaled to `width` px so polling it stays cheap.
 pub fn screen_data_url(adb: &Path, serial: &str, width: u32) -> Result<String> {
-    let png = crate::adb::screencap(adb, serial)?;
+    display_data_url(adb, serial, None, width)
+}
+
+/// One display's screen as a `data:` URL; `surface` is its SurfaceFlinger id.
+pub fn display_data_url(adb: &Path, serial: &str, surface: Option<&str>, width: u32) -> Result<String> {
+    let png = crate::adb::screencap_on(adb, serial, surface)?;
     let (mime, bytes) = shrink(&png, width).unwrap_or(("image/png", png));
     Ok(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
 }

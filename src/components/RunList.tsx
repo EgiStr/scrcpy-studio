@@ -5,7 +5,7 @@ import { openPath } from "@tauri-apps/plugin-opener";
 import { ChevronRight } from "lucide-react";
 import { errMessage, qaCancel, type QaJob, type QaStatus } from "../lib/ipc";
 import { Button } from "./ui";
-import { JobFeed, StatusBadge, since } from "./qa";
+import { JobFeed, SessionScreen, StatusBadge, since } from "./qa";
 import { RunFindings } from "./RunFindings";
 
 const ORDER: QaStatus[] = ["running", "queued", "failed", "error", "blocked", "passed", "cancelled"];
@@ -69,9 +69,14 @@ function JobRow({ job, onError }: { job: QaJob; onError: (e: string) => void }) 
         </span>
       </div>
       {job.note && job.status !== "passed" && <p className="mt-1 text-xs text-zinc-500">{job.note}</p>}
-      {watch && (
-        <div className="mt-2">
-          <JobFeed job={job} />
+      {(watch || job.display != null) && (
+        <div className="mt-2 flex gap-3">
+          <SessionScreen job={job} onError={onError} />
+          {watch && (
+            <div className="min-w-0 flex-1">
+              <JobFeed job={job} />
+            </div>
+          )}
         </div>
       )}
     </li>
