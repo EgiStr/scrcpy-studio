@@ -73,7 +73,7 @@ impl QaConfig {
         Ok(std::fs::write(data_dir.join("qa.json"), text)?)
     }
 
-    fn skill_root(&self) -> Result<PathBuf> {
+    pub(crate) fn skill_root(&self) -> Result<PathBuf> {
         let base = PathBuf::from(&self.skill_dir);
         [base.clone(), base.join("skills").join("mytelkomsel-qa")]
             .into_iter()
@@ -148,7 +148,7 @@ fn ready_devices(adb: &Path) -> Vec<String> {
 
 // ---- jobs ----
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Scenario {
     /// Absolute path of a test set file.
     pub testset: String,
@@ -157,6 +157,9 @@ pub struct Scenario {
     /// A goal the AI agent drives toward instead of `run.py` (the test set is then unused).
     #[serde(default)]
     pub goal: Option<PlanItem>,
+    /// Serials this scenario may run on; empty means any free device.
+    #[serde(default)]
+    pub devices: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -211,6 +214,9 @@ pub struct Job {
     /// "script" (`run.py`) or "agent" (the AI drives).
     pub kind: String,
     pub goal: Option<PlanItem>,
+    /// Serials the job may run on; empty means any free device.
+    #[serde(default)]
+    pub devices: Vec<String>,
     /// Tool calls the agent has made so far.
     pub actions: u32,
     pub status: Status,
@@ -277,10 +283,20 @@ fn refine(status: Status, evidence_dir: &Path) -> Status {
     if only_errors { Status::Error } else { Status::Failed }
 }
 
-/// Pair queued jobs (oldest first) with free devices. A leased device is never handed out.
-fn assign(queued: &[u32], ready: &[String], leased: &HashMap<String, Lease>, slots: usize) -> Vec<(u32, String)> {
-    let free = ready.iter().filter(|s| !leased.contains_key(*s));
-    queued.iter().copied().zip(free.cloned()).take(slots).collect()
+/// Pair queued jobs (oldest first) with free devices they may run on. A leased device is
+/// never handed out, and a job waiting for its own device does not hold up later jobs.
+fn assign(queued: &[(u32, Vec<String>)], ready: &[String], leased: &HashMap<String, Lease>, slots: usize) -> Vec<(u32, String)> {
+    let mut free: Vec<&String> = ready.iter().filter(|s| !leased.contains_key(*s)).collect();
+    let mut out = Vec::new();
+    for (id, allowed) in queued {
+        if out.len() >= slots || free.is_empty() {
+            break;
+        }
+        if let Some(i) = free.iter().position(|s| allowed.is_empty() || allowed.contains(s)) {
+            out.push((*id, free.remove(i).clone()));
+        }
+    }
+    out
 }
 
 // ---- engine ----
@@ -403,6 +419,7 @@ impl QaEngine {
                 only: s.only.map(|o| o.trim().to_string()).filter(|o| !o.is_empty()),
                 kind: if s.goal.is_some() { "agent" } else { "script" }.into(),
                 goal: s.goal,
+                devices: s.devices.into_iter().map(|d| d.trim().to_string()).filter(|d| !d.is_empty()).collect(),
                 actions: 0,
                 status: Status::Queued,
                 serial: None,
@@ -498,7 +515,8 @@ impl QaEngine {
         let ready = (settings.devices)();
         let mut inner = self.inner.lock().unwrap();
         drop_disconnected(&mut inner, &ready);
-        let queued: Vec<u32> = inner.jobs.iter().filter(|j| j.status == Status::Queued).map(|j| j.id).collect();
+        let queued: Vec<(u32, Vec<String>)> =
+            inner.jobs.iter().filter(|j| j.status == Status::Queued).map(|j| (j.id, j.devices.clone())).collect();
         let slots = settings.max_parallel.saturating_sub(inner.children.len());
         for (id, serial) in assign(&queued, &ready, &inner.leases, slots) {
             start(&mut inner, &settings, id, serial);
@@ -777,14 +795,48 @@ mod tests {
     fn assign_skips_leased_devices_and_respects_slots() {
         let ready = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let leased: HashMap<String, Lease> = [lease("a", 9)].into();
-        assert_eq!(assign(&[1, 2, 3], &ready, &leased, 5), vec![(1, "b".into()), (2, "c".into())]);
-        assert_eq!(assign(&[1, 2, 3], &ready, &leased, 1), vec![(1, "b".into())]);
-        assert!(assign(&[1], &ready, &leased, 0).is_empty());
+        let any = |ids: &[u32]| ids.iter().map(|i| (*i, Vec::new())).collect::<Vec<_>>();
+        assert_eq!(assign(&any(&[1, 2, 3]), &ready, &leased, 5), vec![(1, "b".into()), (2, "c".into())]);
+        assert_eq!(assign(&any(&[1, 2, 3]), &ready, &leased, 1), vec![(1, "b".into())]);
+        assert!(assign(&any(&[1]), &ready, &leased, 0).is_empty());
+    }
+
+    #[test]
+    fn assign_keeps_pinned_jobs_on_their_devices() {
+        let ready = vec!["a".to_string(), "b".to_string()];
+        let none: HashMap<String, Lease> = HashMap::new();
+        let on = |s: &str| vec![s.to_string()];
+        // Two jobs pinned to "b": the first takes it, the second waits; the unpinned job
+        // behind them is not held up and takes "a".
+        assert_eq!(
+            assign(&[(1, on("b")), (2, on("b")), (3, vec![])], &ready, &none, 5),
+            vec![(1, "b".into()), (3, "a".into())]
+        );
+        // A job pinned to a device that is busy or absent waits; others still start.
+        let leased: HashMap<String, Lease> = [lease("a", 9)].into();
+        assert_eq!(assign(&[(1, on("a")), (2, on("zz")), (3, vec![])], &ready, &leased, 5), vec![(3, "b".into())]);
+        // One job per device ("run on every phone") runs on both at once.
+        assert_eq!(assign(&[(1, on("a")), (2, on("b"))], &ready, &none, 2), vec![(1, "a".into()), (2, "b".into())]);
+    }
+
+    #[test]
+    fn a_job_pinned_to_a_device_runs_there() {
+        let out = tempfile::tempdir().unwrap();
+        let engine = QaEngine::new();
+        let pinned = vec![
+            Scenario { testset: "0".into(), devices: vec!["dev-b".into()], ..Default::default() },
+            Scenario { testset: "0".into(), devices: vec!["dev-b".into()], ..Default::default() },
+        ];
+        engine.submit_with(fake(out.path(), &["dev-a", "dev-b"], 2, 60), pinned).unwrap();
+        let state = wait_done(&engine, |s| {
+            assert!(s.jobs.iter().filter(|j| j.status == Status::Running).count() <= 1, "one pinned device, one job at a time");
+        });
+        assert!(state.jobs.iter().all(|j| j.serial.as_deref() == Some("dev-b") && j.status == Status::Passed));
     }
 
     #[test]
     fn labels_scenarios_by_testset_and_case_filter() {
-        let s = Scenario { testset: "C:\\x\\veronika-starter.yaml".into(), only: Some(" VER-T001 ".into()), goal: None };
+        let s = Scenario { testset: "C:\\x\\veronika-starter.yaml".into(), only: Some(" VER-T001 ".into()), ..Default::default() };
         assert_eq!(scenario_label(&s), "veronika-starter:VER-T001");
         assert_eq!(slug("veronika-starter:VER-T001"), "veronika-starter_VER-T001");
     }
@@ -843,7 +895,7 @@ elif mode == "loop":
 
     fn goal() -> Scenario {
         let case = PlanItem { kind: "goal".into(), id: Some("AI-001".into()), goal: Some("Buka Roaming".into()), ..Default::default() };
-        Scenario { testset: String::new(), only: None, goal: Some(case) }
+        Scenario { goal: Some(case), ..Default::default() }
     }
 
     /// Run one goal job with the fake agent in `mode`; return it and its trace.
@@ -860,7 +912,7 @@ elif mode == "loop":
     }
 
     fn scenarios(codes: &[&str]) -> Vec<Scenario> {
-        codes.iter().map(|c| Scenario { testset: c.to_string(), only: None, goal: None }).collect()
+        codes.iter().map(|c| Scenario { testset: c.to_string(), ..Default::default() }).collect()
     }
 
     fn wait_done(engine: &QaEngine, mut each: impl FnMut(&QaState)) -> QaState {
@@ -1041,7 +1093,7 @@ elif mode == "loop":
             .map(|item| {
                 let (file, only) = item.split_once(':').unwrap_or((item, ""));
                 let testset = testsets.iter().find(|t| t.ends_with(file)).expect("test set").clone();
-                Scenario { testset, only: Some(only.to_string()), goal: None }
+                Scenario { testset, only: Some(only.to_string()), ..Default::default() }
             })
             .collect();
 
@@ -1114,7 +1166,7 @@ elif mode == "loop":
             .map(|item| {
                 let (file, only) = item.split_once(':').unwrap_or((item, ""));
                 let testset = testsets.iter().find(|t| t.ends_with(file)).expect("test set").clone();
-                Scenario { testset, only: Some(only.to_string()), goal: None }
+                Scenario { testset, only: Some(only.to_string()), ..Default::default() }
             })
             .collect();
 

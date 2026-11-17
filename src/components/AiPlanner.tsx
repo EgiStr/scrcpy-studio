@@ -1,11 +1,30 @@
-// Describe what to test; the AI proposes a plan from the QA skill's test sets and new goal
-// scenarios. Nothing runs until the tester approves it.
-import { useState } from "react";
-import { aiPlan, errMessage, qaSubmit, type Plan, type PlanItem } from "../lib/ipc";
-import { Button } from "./ui";
+// Describe what to test, then choose how it runs:
+// - Scenario: the AI writes a test set (YAML) that run.py runs with no model in the loop;
+//   you review and edit the YAML, it is saved and can be run again from "Pick test sets".
+// - Agent: the AI proposes a plan from the existing test sets and new goal scenarios it
+//   drives on the phone itself.
+// Nothing runs until the tester approves it.
+import { useEffect, useState } from "react";
+import {
+  aiPlan,
+  aiScenario,
+  errMessage,
+  qaScenarioCheck,
+  qaScenarioSave,
+  qaSubmit,
+  type Plan,
+  type PlanItem,
+  type QaScenario,
+  type ScenarioCase,
+} from "../lib/ipc";
+import { remember, remembered } from "../lib/remember";
+import { Button, Tabs } from "./ui";
+import { forTarget, type Target } from "./DeviceTarget";
 
 const INPUT =
   "min-w-0 rounded-md border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-emerald-500 placeholder:text-zinc-600";
+
+type Mode = "scenario" | "agent";
 
 const fileName = (path: string) => path.split(/[\\/]/).pop() ?? path;
 
@@ -14,20 +33,35 @@ function title(it: PlanItem) {
   return `${it.id} · ${it.topic ?? ""}`;
 }
 
-export function AiPlanner({ onQueued }: { onQueued: (runId: string) => void }) {
+export function AiPlanner({ target, onQueued }: { target: Target; onQueued: (runId: string) => void }) {
+  const [mode, setMode] = useState<Mode>(() => remembered("planner.mode", ["scenario", "agent"] as Mode[], "scenario"));
+  useEffect(() => {
+    remember("planner.mode", mode);
+  }, [mode]);
   const [objective, setObjective] = useState("");
   const [plan, setPlan] = useState<Plan>();
   const [keep, setKeep] = useState<boolean[]>([]);
+  const [yaml, setYaml] = useState<string>();
+  const [cost, setCost] = useState<number | null>();
+  const [cases, setCases] = useState<ScenarioCase[]>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
 
-  async function makePlan() {
+  async function write() {
     setBusy(true);
     setError(undefined);
     try {
-      const p = await aiPlan(objective);
-      setPlan(p);
-      setKeep(p.items.map(() => true));
+      if (mode === "agent") {
+        const p = await aiPlan(objective);
+        setPlan(p);
+        setKeep(p.items.map(() => true));
+      } else {
+        const d = await aiScenario(objective);
+        setYaml(d.yaml);
+        setCost(d.costUsd);
+        setCases(undefined);
+        check(d.yaml);
+      }
     } catch (e) {
       setError(errMessage(e));
     } finally {
@@ -35,25 +69,104 @@ export function AiPlanner({ onQueued }: { onQueued: (runId: string) => void }) {
     }
   }
 
-  async function approve() {
+  async function check(text: string) {
+    try {
+      setCases((await qaScenarioCheck(text)).cases);
+      setError(undefined);
+    } catch (e) {
+      setCases(undefined);
+      setError(errMessage(e));
+    }
+  }
+
+  async function submit(scenarios: QaScenario[]) {
+    onQueued(await qaSubmit(forTarget(scenarios, target)));
+    setObjective("");
+  }
+
+  async function approvePlan() {
     if (!plan) return;
     const scenarios = plan.items
       .filter((_, i) => keep[i])
-      .map((it) =>
-        it.kind === "testset" ? { testset: it.testset ?? "", only: it.only ?? undefined } : { testset: "", goal: it },
-      );
+      .map((it) => (it.kind === "testset" ? { testset: it.testset ?? "", only: it.only ?? undefined } : { testset: "", goal: it }));
     try {
-      onQueued(await qaSubmit(scenarios));
+      await submit(scenarios);
       setPlan(undefined);
-      setObjective("");
     } catch (e) {
       setError(errMessage(e));
     }
   }
 
-  const kept = keep.filter(Boolean).length;
+  async function saveAndRun(run: boolean) {
+    if (yaml === undefined) return;
+    try {
+      const path = await qaScenarioSave(yaml);
+      if (run) await submit([{ testset: path }]);
+      setYaml(undefined);
+      setCases(undefined);
+      if (!run) setError(undefined);
+    } catch (e) {
+      setError(errMessage(e));
+    }
+  }
 
+  // ---- review a written scenario ----
+  if (yaml !== undefined) {
+    return (
+      <div>
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+          <span className="text-sm text-zinc-300">
+            Review the scenario: edit the YAML if needed
+            {cost != null && <span className="text-zinc-500"> · writing cost ${cost.toFixed(3)}</span>}
+          </span>
+          <div className="flex gap-2">
+            <Button variant="ghost" onClick={() => setYaml(undefined)}>
+              Back
+            </Button>
+            <Button variant="ghost" onClick={() => check(yaml)}>
+              Check
+            </Button>
+            <Button variant="ghost" disabled={!cases} onClick={() => saveAndRun(false)}>
+              Save only
+            </Button>
+            <Button variant="primary" disabled={!cases} onClick={() => saveAndRun(true)}>
+              Save and run {cases ? `${cases.length} ${cases.length === 1 ? "case" : "cases"}` : ""}
+            </Button>
+          </div>
+        </div>
+        <textarea
+          aria-label="Scenario YAML"
+          spellCheck={false}
+          className={INPUT + " h-72 w-full resize-y font-mono text-xs"}
+          value={yaml}
+          onChange={(e) => {
+            setYaml(e.target.value);
+            setCases(undefined);
+          }}
+        />
+        {error && <p className="mt-2 whitespace-pre-wrap text-xs text-red-400">{error}</p>}
+        {cases && (
+          <ul className="mt-2 flex flex-col gap-1 text-xs">
+            {cases.map((c) => (
+              <li key={c.id} className="flex gap-2 text-zinc-300">
+                <span className="font-mono text-zinc-500">{c.id}</span>
+                <span className="rounded bg-zinc-800 px-1.5 text-[10px] uppercase text-zinc-300">{c.surface}</span>
+                <span className="truncate">{c.question || c.topic}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="mt-2 text-xs text-zinc-500">
+          Checked with the QA skill's own loader. Only read-only surfaces (Veronika, search, home) with ASCII questions
+          are allowed; the runner taps nothing that buys, pays or sends. Saved scenarios also appear in Pick test sets.
+        </p>
+      </div>
+    );
+  }
+
+  // ---- review an agent plan ----
   if (plan) {
+    const kept = keep.filter(Boolean).length;
     return (
       <div>
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -65,7 +178,7 @@ export function AiPlanner({ onQueued }: { onQueued: (runId: string) => void }) {
             <Button variant="ghost" onClick={() => setPlan(undefined)}>
               Back
             </Button>
-            <Button variant="primary" disabled={kept === 0} onClick={approve}>
+            <Button variant="primary" disabled={kept === 0} onClick={approvePlan}>
               Run {kept} {kept === 1 ? "scenario" : "scenarios"}
             </Button>
           </div>
@@ -121,23 +234,39 @@ export function AiPlanner({ onQueued }: { onQueued: (runId: string) => void }) {
     );
   }
 
+  // ---- describe ----
   return (
     <div>
+      <div className="mb-2 flex flex-wrap items-center gap-3">
+        <Tabs<Mode>
+          tabs={[
+            { id: "scenario", label: "Scenario (YAML)" },
+            { id: "agent", label: "Agent" },
+          ]}
+          value={mode}
+          onChange={setMode}
+        />
+        <span className="text-xs text-zinc-500">
+          {mode === "scenario"
+            ? "The AI writes a test set you review and save; the runner plays it with no model, the same every time."
+            : "The AI picks existing test sets and drives the phone itself for anything new."}
+        </span>
+      </div>
       <textarea
         className={INPUT + " h-24 w-full resize-y"}
-        placeholder="Example: Check that search finds 10 GB internet packages with their price, and that the Roaming menu lists packages for Japan."
+        placeholder="Example: Check that search finds 10 GB internet packages with their price, and that Veronika explains roaming packages for Japan."
         value={objective}
         onChange={(e) => setObjective(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && objective.trim() && !busy) makePlan();
+          if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && objective.trim() && !busy) write();
         }}
       />
       <div className="mt-2 flex items-center gap-3">
-        <Button variant="primary" disabled={busy || !objective.trim()} onClick={makePlan}>
-          {busy ? "Planning…" : "Make a plan"}
+        <Button variant="primary" disabled={busy || !objective.trim()} onClick={write}>
+          {busy ? (mode === "scenario" ? "Writing…" : "Planning…") : mode === "scenario" ? "Write a scenario" : "Make a plan"}
         </Button>
         <span className="text-xs text-zinc-500">
-          {busy ? "The AI is reading the test sets; this can take a minute or two." : "Ctrl+Enter · you review the plan before anything runs"}
+          {busy ? "The AI is reading the test sets; this can take a minute or two." : "Ctrl+Enter · you review it before anything runs"}
         </span>
       </div>
       {error && <p className="mt-3 whitespace-pre-wrap text-xs text-red-400">{error}</p>}

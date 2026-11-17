@@ -2,13 +2,14 @@
 // queue to findings on one page.
 import { useEffect, useState } from "react";
 import { remember, remembered } from "../lib/remember";
-import { qaState, type QaJob, type QaLease } from "../lib/ipc";
+import { qaConfigGet, qaState, type QaJob, type QaLease } from "../lib/ipc";
 import { useDevices } from "../state/devices";
 import { Button, Tabs } from "../components/ui";
 import { usePoll } from "../components/qa";
 import { AiPlanner } from "../components/AiPlanner";
 import { TestsetPicker } from "../components/TestsetPicker";
 import { RunList } from "../components/RunList";
+import { DeviceTarget, type Target } from "../components/DeviceTarget";
 
 type Mode = "ai" | "sets";
 
@@ -21,6 +22,13 @@ export function TestPage({ onDevices, onSettings }: { onDevices: () => void; onS
   const [leases, setLeases] = useState<QaLease[]>([]);
   const [open, setOpen] = useState<string>();
   const devices = useDevices((s) => s.devices);
+  const [target, setTarget] = useState<Target>({ serials: [], spread: "share" });
+  const [maxParallel, setMaxParallel] = useState(2);
+  useEffect(() => {
+    qaConfigGet()
+      .then((c) => setMaxParallel(c.maxParallel))
+      .catch(() => undefined);
+  }, []);
 
   usePoll(
     async () => {
@@ -72,10 +80,11 @@ export function TestPage({ onDevices, onSettings }: { onDevices: () => void; onS
               onChange={setMode}
             />
           </div>
+          <DeviceTarget devices={devices} leases={leases} maxParallel={maxParallel} value={target} onChange={setTarget} />
           {mode === "ai" ? (
-            <AiPlanner onQueued={setOpen} />
+            <AiPlanner target={target} onQueued={setOpen} />
           ) : (
-            <TestsetPicker onQueued={setOpen} onSettings={onSettings} />
+            <TestsetPicker target={target} onQueued={setOpen} onSettings={onSettings} />
           )}
           {ready.length === 0 && (
             <p className="mt-3 flex flex-wrap items-center gap-2 text-xs text-amber-300">

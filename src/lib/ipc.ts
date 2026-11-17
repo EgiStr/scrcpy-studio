@@ -150,6 +150,7 @@ export interface QaJob {
   only?: string | null;
   kind: "script" | "agent";
   goal?: PlanItem | null;
+  devices: string[];
   actions: number;
   status: QaStatus;
   serial?: string | null;
@@ -169,7 +170,13 @@ export interface QaLease {
 export const qaConfigGet = () => invoke<QaConfig>("qa_config_get");
 export const qaConfigSet = (config: QaConfig) => invoke<void>("qa_config_set", { config });
 export const qaTestsets = () => invoke<string[]>("qa_testsets");
-export const qaSubmit = (scenarios: { testset: string; only?: string; goal?: PlanItem }[]) =>
+export interface QaScenario {
+  testset: string;
+  only?: string;
+  goal?: PlanItem;
+  devices?: string[];
+}
+export const qaSubmit = (scenarios: QaScenario[]) =>
   invoke<string>("qa_submit", { scenarios });
 export const qaState = () => invoke<{ jobs: QaJob[]; leases: QaLease[] }>("qa_state");
 export const qaCancel = (id: number) => invoke<void>("qa_cancel", { id });
@@ -262,6 +269,21 @@ export interface PlanItem {
   expected?: string | null;
   why?: string | null;
 }
+export interface ScenarioDraft {
+  name: string;
+  yaml: string;
+  costUsd?: number | null;
+}
+export interface ScenarioCase {
+  id: string;
+  surface: string;
+  question: string;
+  topic: string;
+}
+export const aiScenario = (objective: string) => invoke<ScenarioDraft>("ai_scenario", { objective });
+export const qaScenarioCheck = (yaml: string) =>
+  invoke<{ name: string; cases: ScenarioCase[] }>("qa_scenario_check", { yaml });
+export const qaScenarioSave = (yaml: string) => invoke<string>("qa_scenario_save", { yaml });
 export interface Plan {
   items: PlanItem[];
   rejected: string[];

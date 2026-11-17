@@ -594,7 +594,10 @@ pub fn qa_config_set(state: State<AppState>, config: QaConfig) -> Result<()> {
 
 #[tauri::command]
 pub fn qa_testsets(state: State<AppState>) -> Result<Vec<String>> {
-    QaConfig::load(&state.data_dir).testsets()
+    // The skill's test sets, then the scenarios saved from the AI (Scenario mode).
+    let mut sets = QaConfig::load(&state.data_dir).testsets()?;
+    sets.extend(crate::scenario::list(&state.data_dir));
+    Ok(sets)
 }
 
 #[tauri::command]
@@ -640,6 +643,33 @@ pub fn ai_plan(state: State<AppState>, objective: String) -> Result<crate::agent
     });
     state.qa.audit("plan", None, &detail.to_string());
     Ok(plan)
+}
+
+/// Scenario mode: the AI writes a test set (YAML) for `run.py`. Nothing is saved or run
+/// until the tester reviews it.
+#[tauri::command(async)]
+pub fn ai_scenario(state: State<AppState>, objective: String) -> Result<crate::scenario::Draft> {
+    let cfg = QaConfig::load(&state.data_dir).agent()?;
+    let draft = crate::scenario::draft(&cfg, &objective)?;
+    let detail = serde_json::json!({ "objective": objective, "model": cfg.model, "costUsd": draft.cost_usd, "name": draft.name });
+    state.qa.audit("scenario-draft", None, &detail.to_string());
+    Ok(draft)
+}
+
+#[tauri::command(async)]
+pub fn qa_scenario_check(state: State<AppState>, yaml: String) -> Result<crate::scenario::Checked> {
+    let cfg = QaConfig::load(&state.data_dir);
+    crate::scenario::check(std::path::Path::new(&cfg.python), &cfg.skill_root()?, &state.data_dir, &yaml)
+}
+
+/// Check and save a reviewed scenario; returns its path (a test set `qa_submit` can run).
+#[tauri::command(async)]
+pub fn qa_scenario_save(state: State<AppState>, yaml: String) -> Result<String> {
+    let cfg = QaConfig::load(&state.data_dir);
+    let path = crate::scenario::save(std::path::Path::new(&cfg.python), &cfg.skill_root()?, &state.data_dir, &yaml)?;
+    let path = path.to_string_lossy().to_string();
+    state.qa.audit("scenario-save", None, &path);
+    Ok(path)
 }
 
 /// Check every dependency a QA or AI run needs; slow (it asks the model once).

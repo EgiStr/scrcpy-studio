@@ -1,11 +1,23 @@
-// Pick existing test sets (optionally only some case ids); each becomes one job on its own phone.
+// Pick existing test sets and saved AI scenarios (optionally only some case ids); each
+// becomes one job on its own phone.
 import { useEffect, useState } from "react";
 import { errMessage, qaSubmit, qaTestsets } from "../lib/ipc";
 import { Button } from "./ui";
+import { forTarget, type Target } from "./DeviceTarget";
+
+const isSaved = (path: string) => /[\\/]scenarios[\\/]/.test(path);
 
 const fileName = (path: string) => path.split(/[\\/]/).pop() ?? path;
 
-export function TestsetPicker({ onQueued, onSettings }: { onQueued: (runId: string) => void; onSettings: () => void }) {
+export function TestsetPicker({
+  target,
+  onQueued,
+  onSettings,
+}: {
+  target: Target;
+  onQueued: (runId: string) => void;
+  onSettings: () => void;
+}) {
   const [testsets, setTestsets] = useState<string[]>();
   const [picked, setPicked] = useState<Record<string, boolean>>({});
   const [only, setOnly] = useState<Record<string, string>>({});
@@ -26,7 +38,7 @@ export function TestsetPicker({ onQueued, onSettings }: { onQueued: (runId: stri
       .filter((t) => picked[t])
       .map((t) => ({ testset: t, only: only[t]?.trim() || undefined }));
     try {
-      onQueued(await qaSubmit(scenarios));
+      onQueued(await qaSubmit(forTarget(scenarios, target)));
       setPicked({});
       setOnly({});
       setError(undefined);
@@ -72,6 +84,7 @@ export function TestsetPicker({ onQueued, onSettings }: { onQueued: (runId: stri
               <span className="truncate" title={t}>
                 {fileName(t)}
               </span>
+              {isSaved(t) && <span className="shrink-0 rounded bg-sky-500/20 px-1 text-[10px] text-sky-300">AI scenario</span>}
             </label>
             {picked[t] && (
               <input
@@ -85,7 +98,8 @@ export function TestsetPicker({ onQueued, onSettings }: { onQueued: (runId: stri
         ))}
       </div>
       <p className="mt-2 text-xs text-zinc-500">
-        Each test set runs as one job on its own phone. Phones that share one MyTelkomsel account can interfere with each other.
+        Each test set runs as one job on its own phone, in parallel when several phones are free. Phones that share one
+        MyTelkomsel account can interfere with each other.
       </p>
     </div>
   );

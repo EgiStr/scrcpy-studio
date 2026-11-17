@@ -42,7 +42,9 @@ function JobRow({ job, onError }: { job: QaJob; onError: (e: string) => void }) 
         <span className="min-w-0 flex-1 truncate text-zinc-200" title={job.goal?.goal ?? job.scenario}>
           {job.scenario}
         </span>
-        <span className="font-mono text-xs text-zinc-500">{job.serial ?? "waiting for a phone"}</span>
+        <span className="font-mono text-xs text-zinc-500">
+          {job.serial ?? (job.devices?.length ? `waiting for ${job.devices.join(" or ")}` : "waiting for a phone")}
+        </span>
         <span className="w-16 text-right font-mono text-xs text-zinc-500">{since(job.startedAt, job.finishedAt)}</span>
         <span className="flex gap-1">
           {(job.evidenceDir || job.status === "running") && (

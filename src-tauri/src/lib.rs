@@ -14,6 +14,7 @@ mod error;
 mod profiles;
 mod qa;
 mod qr_pair;
+mod scenario;
 mod session;
 mod shortcut;
 mod state;
@@ -175,6 +176,9 @@ pub fn run() {
             commands::qa_log,
             commands::qa_trace,
             commands::ai_plan,
+            commands::ai_scenario,
+            commands::qa_scenario_check,
+            commands::qa_scenario_save,
             commands::qa_events,
             commands::qa_doctor,
             commands::qa_findings,
