@@ -19,6 +19,7 @@ mod session;
 mod shortcut;
 mod state;
 mod store;
+mod vsession;
 mod workers;
 
 use state::AppState;

@@ -452,7 +452,7 @@ impl Guard {
 
 /// Write the case, MCP config and guard into `dir` and build the CLI command that drives
 /// it. The caller pipes stdout (the stream-json trace) and sets the device environment.
-pub fn command(cfg: &AgentConfig, serial: &str, dir: &Path, case: &PlanItem, state_dir: &Path, path_env: Option<&std::ffi::OsStr>) -> std::io::Result<Command> {
+pub fn command(cfg: &AgentConfig, serial: &str, display: Option<u32>, dir: &Path, case: &PlanItem, state_dir: &Path, path_env: Option<&std::ffi::OsStr>) -> std::io::Result<Command> {
     let write_json = |name: &str, v: &serde_json::Value| std::fs::write(dir.join(name), serde_json::to_string_pretty(v).unwrap_or_default());
     write_json("plan.yaml", &testset_json(case, cfg.max_actions))?;
 
@@ -462,6 +462,10 @@ pub fn command(cfg: &AgentConfig, serial: &str, dir: &Path, case: &PlanItem, sta
         "PYTHONIOENCODING": "utf-8",
         "PYTHONUTF8": "1",
     });
+    if let Some(d) = display {
+        // The skill sends every tap, key, screenshot and screen read to this display.
+        env["ANDROID_DISPLAY"] = serde_json::Value::String(d.to_string());
+    }
     if let Some(p) = path_env {
         env["PATH"] = serde_json::Value::String(p.to_string_lossy().to_string());
     }
@@ -768,12 +772,13 @@ mod tests {
             max_actions: 40,
         };
         let case = PlanItem { kind: "goal".into(), id: Some("AI-001".into()), goal: Some("Buka Roaming".into()), keypoints: vec!["re:roaming :: Roaming".into()], ..Default::default() };
-        let cmd = command(&cfg, "SER1", dir.path(), &case, Path::new("C:/state/SER1"), None).unwrap();
+        let cmd = command(&cfg, "SER1", Some(12), dir.path(), &case, Path::new("C:/state/SER1"), None).unwrap();
         let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
         assert!(args.iter().any(|a| a.contains("mcp__telkomsel-qa__adb_input_tap")));
         assert!(!args.iter().any(|a| a.contains("adb_apps_install") || a.contains("qa_run")));
         let mcp: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join("mcp.json")).unwrap()).unwrap();
         assert_eq!(mcp["mcpServers"]["telkomsel-qa"]["env"]["ANDROID_SERIAL"], "SER1");
+        assert_eq!(mcp["mcpServers"]["telkomsel-qa"]["env"]["ANDROID_DISPLAY"], "12");
         let set: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join("plan.yaml")).unwrap()).unwrap();
         assert_eq!(set["surface"], "goal");
         assert_eq!(set["cases"][0]["expected_keypoints"][0], "re:roaming :: Roaming");

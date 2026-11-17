@@ -133,6 +133,9 @@ export interface QaConfig {
   aiCommand: string;
   aiModel: string;
   aiMaxActions: number;
+  /** AI tests per physical phone: 0 on the phone's own screen, 1 or 2 on hidden displays. */
+  phoneSessions: number;
+  physicalFirst: boolean;
 }
 export type QaStatus =
   | "queued"
@@ -154,6 +157,8 @@ export interface QaJob {
   actions: number;
   status: QaStatus;
   serial?: string | null;
+  /** The hidden display the job ran on; absent for the phone's own screen. */
+  display?: number | null;
   evidenceDir?: string | null;
   exitCode?: number | null;
   note?: string | null;
@@ -163,6 +168,8 @@ export interface QaJob {
 }
 export interface QaLease {
   serial: string;
+  /** Session 1 or 2 on the phone; null when the job has the whole device. */
+  slot?: number | null;
   jobId: number;
   runId: string;
   acquiredAt: number;

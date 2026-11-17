@@ -39,6 +39,11 @@ pub struct QaConfig {
     pub ai_model: String,
     /// Tool calls one agent job may make before it is stopped.
     pub ai_max_actions: u32,
+    /// AI tests one physical phone runs at once, each on its own hidden display (0: one test
+    /// on the phone's own screen; at most 2, MyTelkomsel's own limit).
+    pub phone_sessions: usize,
+    /// Give jobs to physical phones before emulators.
+    pub physical_first: bool,
 }
 
 impl Default for QaConfig {
@@ -52,6 +57,8 @@ impl Default for QaConfig {
             ai_command: "claude".into(),
             ai_model: "claude-sonnet-5-5".into(),
             ai_max_actions: 80,
+            phone_sessions: 2,
+            physical_first: true,
         }
     }
 }
@@ -121,7 +128,14 @@ impl QaConfig {
         let run_py = self.run_py()?;
         let adb = adb.to_path_buf();
         let probe = adb.clone();
+        let scrcpy = adb.with_file_name(if cfg!(windows) { "scrcpy.exe" } else { "scrcpy" });
         Ok(Settings {
+            sessions: SessionSettings {
+                per_phone: self.phone_sessions.min(2),
+                physical_first: self.physical_first,
+                scrcpy: scrcpy.is_file().then_some(scrcpy),
+                adb: Some(adb.clone()),
+            },
             runner: Runner {
                 program: PathBuf::from(&self.python),
                 args: vec![run_py.to_string_lossy().to_string()],
@@ -221,6 +235,9 @@ pub struct Job {
     pub actions: u32,
     pub status: Status,
     pub serial: Option<String>,
+    /// The hidden display the job ran on; None for the phone's own screen.
+    #[serde(default)]
+    pub display: Option<u32>,
     pub evidence_dir: Option<String>,
     pub exit_code: Option<i32>,
     pub note: Option<String>,
@@ -233,6 +250,8 @@ pub struct Job {
 #[serde(rename_all = "camelCase")]
 pub struct Lease {
     pub serial: String,
+    /// The session (1 or 2) on that phone, or None for the whole device.
+    pub slot: Option<u8>,
     pub job_id: u32,
     pub run_id: String,
     pub acquired_at: u64,
@@ -283,17 +302,74 @@ fn refine(status: Status, evidence_dir: &Path) -> Status {
     if only_errors { Status::Error } else { Status::Failed }
 }
 
-/// Pair queued jobs (oldest first) with free devices they may run on. A leased device is
-/// never handed out, and a job waiting for its own device does not hold up later jobs.
-fn assign(queued: &[(u32, Vec<String>)], ready: &[String], leased: &HashMap<String, Lease>, slots: usize) -> Vec<(u32, String)> {
-    let mut free: Vec<&String> = ready.iter().filter(|s| !leased.contains_key(*s)).collect();
+/// Where a job runs on its device.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Slot {
+    /// The whole device: its own screen, nothing else running on it.
+    Whole,
+    /// Session 1 or 2 on a physical phone, each on its own hidden display.
+    Session(u8),
+}
+
+fn lease_key(serial: &str, slot: Slot) -> String {
+    match slot {
+        Slot::Whole => serial.to_string(),
+        Slot::Session(n) => format!("{serial}#{n}"),
+    }
+}
+
+/// A queued job as the scheduler sees it.
+pub struct Want {
+    pub id: u32,
+    /// Devices it may run on; empty means any.
+    pub allowed: Vec<String>,
+    /// An AI job; only those run in a session (a scripted run restarts the app, which would
+    /// end the phone's other session).
+    pub agent: bool,
+}
+
+fn is_physical(serial: &str) -> bool {
+    crate::monitor::connection(serial) != "emulator"
+}
+
+/// Pair queued jobs (oldest first) with a free place to run. A leased place is never handed
+/// out, and a job waiting for its own device does not hold up later jobs.
+///
+/// With sessions on, a physical phone runs AI jobs on hidden displays: session 1 only when
+/// nothing runs on the phone (it restarts the app), session 2 only beside a running session 1
+/// (MyTelkomsel makes its second task from the first). A scripted job takes the whole phone.
+fn assign(queued: &[Want], ready: &[String], leased: &HashMap<String, Lease>, slots: usize, per_phone: usize, physical_first: bool) -> Vec<(u32, String, Slot)> {
+    let mut taken: std::collections::HashSet<String> = leased.keys().cloned().collect();
+    let mut devices: Vec<&String> = ready.iter().collect();
+    if physical_first {
+        devices.sort_by_key(|s| !is_physical(s));
+    }
     let mut out = Vec::new();
-    for (id, allowed) in queued {
-        if out.len() >= slots || free.is_empty() {
+    for want in queued {
+        if out.len() >= slots {
             break;
         }
-        if let Some(i) = free.iter().position(|s| allowed.is_empty() || allowed.contains(s)) {
-            out.push((*id, free.remove(i).clone()));
+        let pick = devices.iter().filter(|s| want.allowed.is_empty() || want.allowed.contains(s)).find_map(|s| {
+            let has = |slot| taken.contains(&lease_key(s, slot));
+            let busy = has(Slot::Whole) || has(Slot::Session(1)) || has(Slot::Session(2));
+            let slot = if want.agent && per_phone > 0 && is_physical(s) {
+                if !busy {
+                    Some(Slot::Session(1))
+                } else if per_phone >= 2 && has(Slot::Session(1)) && !has(Slot::Session(2)) {
+                    Some(Slot::Session(2))
+                } else {
+                    None
+                }
+            } else if !busy {
+                Some(Slot::Whole)
+            } else {
+                None
+            };
+            slot.map(|slot| ((*s).clone(), slot))
+        });
+        if let Some((serial, slot)) = pick {
+            taken.insert(lease_key(&serial, slot));
+            out.push((want.id, serial, slot));
         }
     }
     out
@@ -319,6 +395,23 @@ pub struct Settings {
     pub devices: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     /// None when the skill checkout has no MCP server: goal jobs then end as errors.
     pub agent: Option<AgentConfig>,
+    pub sessions: SessionSettings,
+}
+
+#[derive(Clone, Default)]
+pub struct SessionSettings {
+    /// AI tests per physical phone, each on a hidden display (0: none, the whole phone).
+    pub per_phone: usize,
+    pub physical_first: bool,
+    /// The bundled scrcpy, which opens the displays; without it there are no sessions.
+    pub scrcpy: Option<PathBuf>,
+    pub adb: Option<PathBuf>,
+}
+
+impl SessionSettings {
+    fn per_phone(&self) -> usize {
+        if self.scrcpy.is_some() && self.adb.is_some() { self.per_phone } else { 0 }
+    }
 }
 
 /// What the trace reader learns about a running agent job.
@@ -333,6 +426,8 @@ struct Inner {
     jobs: Vec<Job>,
     children: HashMap<u32, Child>,
     meters: HashMap<u32, Arc<Meter>>,
+    /// Open session displays, by job.
+    sessions: HashMap<u32, crate::vsession::Session>,
     leases: HashMap<String, Lease>,
     /// Consecutive device checks a leased serial was missing from.
     missing: HashMap<String, u32>,
@@ -423,6 +518,7 @@ impl QaEngine {
                 actions: 0,
                 status: Status::Queued,
                 serial: None,
+                display: None,
                 evidence_dir: None,
                 exit_code: None,
                 note: None,
@@ -515,13 +611,65 @@ impl QaEngine {
         let ready = (settings.devices)();
         let mut inner = self.inner.lock().unwrap();
         drop_disconnected(&mut inner, &ready);
-        let queued: Vec<(u32, Vec<String>)> =
-            inner.jobs.iter().filter(|j| j.status == Status::Queued).map(|j| (j.id, j.devices.clone())).collect();
+        let queued: Vec<Want> = inner
+            .jobs
+            .iter()
+            .filter(|j| j.status == Status::Queued)
+            .map(|j| Want { id: j.id, allowed: j.devices.clone(), agent: j.goal.is_some() })
+            .collect();
         let slots = settings.max_parallel.saturating_sub(inner.children.len());
-        for (id, serial) in assign(&queued, &ready, &inner.leases, slots) {
-            start(&mut inner, &settings, id, serial);
+        let sessions = &settings.sessions;
+        let mut opening = Vec::new();
+        for (id, serial, slot) in assign(&queued, &ready, &inner.leases, slots, sessions.per_phone(), sessions.physical_first) {
+            match slot {
+                Slot::Whole => start(&mut inner, &settings, id, serial, slot, None),
+                Slot::Session(_) => {
+                    if reserve(&mut inner, &settings, id, &serial, slot) {
+                        opening.push((id, serial, slot));
+                    }
+                }
+            }
+        }
+        drop(inner);
+        // Opening a display takes seconds (scrcpy, then the app); do it outside the lock, in
+        // order, so session 2 finds session 1's display.
+        for (id, serial, slot) in opening {
+            self.open_session(&settings, id, serial, slot);
         }
         true
+    }
+
+    fn open_session(&self, settings: &Settings, id: u32, serial: String, slot: Slot) {
+        let (dir, sibling) = {
+            let inner = self.inner.lock().unwrap();
+            let dir = inner.jobs.iter().find(|j| j.id == id).and_then(|j| j.evidence_dir.clone()).unwrap_or_default();
+            let sibling = inner
+                .leases
+                .values()
+                .find(|l| l.serial == serial && l.slot == Some(1) && l.job_id != id)
+                .and_then(|l| inner.sessions.get(&l.job_id))
+                .map(|s| s.display);
+            (PathBuf::from(dir), sibling)
+        };
+        let opened = match (&settings.sessions.adb, &settings.sessions.scrcpy) {
+            _ if slot == Slot::Session(2) && sibling.is_none() => Err("session 1 on this phone ended before session 2 could open".to_string()),
+            (Some(adb), Some(scrcpy)) => crate::vsession::Session::open(adb, scrcpy, &serial, crate::agent::APP_PACKAGE, sibling, &dir),
+            _ => Err("no scrcpy to open a display with".to_string()),
+        };
+        let mut inner = self.inner.lock().unwrap();
+        let still = inner.jobs.iter().any(|j| j.id == id && j.status == Status::Running);
+        match opened {
+            Ok(session) if still => {
+                let display = session.display;
+                inner.sessions.insert(id, session);
+                start(&mut inner, settings, id, serial, slot, Some(display));
+            }
+            Ok(session) => {
+                std::thread::spawn(move || session.close());
+            }
+            Err(e) if still => finish(&mut inner, id, Status::Error, None, Some(format!("could not open a session: {e}"))),
+            Err(_) => {}
+        }
     }
 }
 
@@ -596,15 +744,43 @@ fn drop_disconnected(inner: &mut Inner, ready: &[String]) {
     }
 }
 
-/// Lease the device to the job and spawn its worker. A spawn failure ends the job as an error.
-fn start(inner: &mut Inner, settings: &Settings, id: u32, serial: String) {
-    let Some(job) = inner.jobs.iter_mut().find(|j| j.id == id) else { return };
-    let dir = settings.artifacts.join(&job.run_id).join(slug(&serial)).join(format!("J{}-{}", job.id, slug(&job.scenario)));
-    job.serial = Some(serial.clone());
+/// Mark the job running and lease its place before anything slow happens, so no other job
+/// gets the same place. Returns false (the job then ended as an error) when its evidence
+/// folder cannot be made.
+fn reserve(inner: &mut Inner, settings: &Settings, id: u32, serial: &str, slot: Slot) -> bool {
+    let Some(job) = inner.jobs.iter_mut().find(|j| j.id == id) else { return false };
+    let dir = settings.artifacts.join(&job.run_id).join(slug(serial)).join(format!("J{}-{}", job.id, slug(&job.scenario)));
+    job.serial = Some(serial.to_string());
     job.evidence_dir = Some(dir.to_string_lossy().to_string());
     job.started_at = Some(now());
     job.status = Status::Running;
-    let lease = Lease { serial: serial.clone(), job_id: id, run_id: job.run_id.clone(), acquired_at: now() };
+    let lease = Lease {
+        serial: serial.to_string(),
+        slot: match slot {
+            Slot::Whole => None,
+            Slot::Session(n) => Some(n),
+        },
+        job_id: id,
+        run_id: job.run_id.clone(),
+        acquired_at: now(),
+    };
+    inner.leases.insert(lease_key(serial, slot), lease);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        finish(inner, id, Status::Error, None, Some(format!("could not make the evidence folder: {e}")));
+        return false;
+    }
+    true
+}
+
+/// Spawn the job's worker on its leased place. A spawn failure ends the job as an error.
+/// `display` is the job's session display, already open (the place was reserved then).
+fn start(inner: &mut Inner, settings: &Settings, id: u32, serial: String, slot: Slot, display: Option<u32>) {
+    if display.is_none() && !reserve(inner, settings, id, &serial, slot) {
+        return;
+    }
+    let Some(job) = inner.jobs.iter_mut().find(|j| j.id == id) else { return };
+    job.display = display;
+    let dir = PathBuf::from(job.evidence_dir.clone().unwrap_or_default());
 
     let goal = job.goal.clone();
     let testset = job.testset.clone();
@@ -626,7 +802,7 @@ fn start(inner: &mut Inner, settings: &Settings, id: u32, serial: String) {
                 let agent = settings.agent.as_ref().ok_or_else(|| {
                     std::io::Error::other("the AI agent is not set up (no mcp/telkomsel-qa-mcp in the QA skill folder)")
                 })?;
-                let mut cmd = crate::agent::command(agent, &serial, &dir, case, &state_dir, path.as_deref())?;
+                let mut cmd = crate::agent::command(agent, &serial, display, &dir, case, &state_dir, path.as_deref())?;
                 cmd.stdout(Stdio::piped());
                 cmd
             }
@@ -643,7 +819,9 @@ fn start(inner: &mut Inner, settings: &Settings, id: u32, serial: String) {
         // ANDROID_SERIAL scopes any adb call the worker makes without -s.
         // The skill's screen-read lock lives in its state directory; one per device keeps
         // workers on different devices from waiting on each other.
+        // ANDROID_DISPLAY points every tap, key, screenshot and screen read at the session.
         cmd.env("ANDROID_SERIAL", &serial)
+            .env("ANDROID_DISPLAY", display.map(|d| d.to_string()).unwrap_or_default())
             .env("ANDROID_SKILLS_STATE", &state_dir)
             .env("PYTHONUNBUFFERED", "1")
             .env("PYTHONIOENCODING", "utf-8")
@@ -673,9 +851,9 @@ fn start(inner: &mut Inner, settings: &Settings, id: u32, serial: String) {
         Ok(child) => {
             if let Some(job) = inner.jobs.iter().find(|j| j.id == id) {
                 persist(inner, job);
-                audit(inner, "start", Some(id), Some(&job.run_id), &format!("on {serial}"));
+                let place = display.map(|d| format!(" display {d}")).unwrap_or_default();
+                audit(inner, "start", Some(id), Some(&job.run_id), &format!("on {serial}{place}"));
             }
-            inner.leases.insert(serial, lease);
             inner.children.insert(id, child);
             if goal.is_some() {
                 inner.meters.insert(id, meter);
@@ -706,6 +884,10 @@ fn record_trace(out: impl std::io::Read, mut trace: std::fs::File, guard: &Guard
 fn finish(inner: &mut Inner, id: u32, status: Status, code: Option<i32>, note: Option<String>) {
     inner.leases.retain(|_, l| l.job_id != id);
     inner.meters.remove(&id);
+    if let Some(session) = inner.sessions.remove(&id) {
+        // A few adb calls and up to 6 s for scrcpy to finish the recording: off the lock.
+        std::thread::spawn(move || session.close());
+    }
     let Some(job) = inner.jobs.iter_mut().find(|j| j.id == id) else { return };
     job.status = status;
     job.exit_code = code;
@@ -766,7 +948,7 @@ mod tests {
     use super::*;
 
     fn lease(serial: &str, job_id: u32) -> (String, Lease) {
-        (serial.into(), Lease { serial: serial.into(), job_id, run_id: "R".into(), acquired_at: 0 })
+        (serial.into(), Lease { serial: serial.into(), slot: None, job_id, run_id: "R".into(), acquired_at: 0 })
     }
 
     #[test]
@@ -791,14 +973,76 @@ mod tests {
         assert_eq!(refine(Status::Passed, dir.path()), Status::Passed);
     }
 
+    /// Scripted jobs with sessions off: the scheduler as it was before sessions.
+    fn plain(queued: &[(u32, Vec<String>)], ready: &[String], leased: &HashMap<String, Lease>, slots: usize) -> Vec<(u32, String)> {
+        let wants: Vec<Want> = queued.iter().map(|(id, allowed)| Want { id: *id, allowed: allowed.clone(), agent: false }).collect();
+        assign(&wants, ready, leased, slots, 0, false).into_iter().map(|(id, s, slot)| {
+            assert_eq!(slot, Slot::Whole);
+            (id, s)
+        }).collect()
+    }
+
+    fn ai(id: u32) -> Want {
+        Want { id, allowed: vec![], agent: true }
+    }
+
+    fn script(id: u32) -> Want {
+        Want { id, allowed: vec![], agent: false }
+    }
+
+    fn held(places: &[(&str, Option<u8>, u32)]) -> HashMap<String, Lease> {
+        places
+            .iter()
+            .map(|(serial, slot, job_id)| {
+                let key = lease_key(serial, slot.map_or(Slot::Whole, Slot::Session));
+                (key, Lease { serial: serial.to_string(), slot: *slot, job_id: *job_id, run_id: "R".into(), acquired_at: 0 })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn one_phone_runs_two_ai_sessions_and_scripts_wait_for_the_whole_phone() {
+        let ready = vec!["phone".to_string()];
+        let none = HashMap::new();
+        // Two AI jobs share the phone: session 1, then session 2 beside it.
+        assert_eq!(
+            assign(&[ai(1), ai(2), ai(3)], &ready, &none, 5, 2, true),
+            vec![(1, "phone".into(), Slot::Session(1)), (2, "phone".into(), Slot::Session(2))]
+        );
+        // A scripted job needs the whole phone, so it waits while any session runs.
+        assert!(assign(&[script(1)], &ready, &held(&[("phone", Some(2), 7)]), 5, 2, true).is_empty());
+        assert_eq!(assign(&[script(1)], &ready, &none, 5, 2, true), vec![(1, "phone".into(), Slot::Whole)]);
+        // With session 1 gone and 2 still running, no new session 1 starts (it restarts the
+        // app); a free session 2 next to a running session 1 is refilled.
+        assert!(assign(&[ai(4)], &ready, &held(&[("phone", Some(2), 7)]), 5, 2, true).is_empty());
+        assert_eq!(assign(&[ai(4)], &ready, &held(&[("phone", Some(1), 7)]), 5, 2, true), vec![(4, "phone".into(), Slot::Session(2))]);
+        // One session per phone, or sessions off: AI jobs take the whole phone one at a time.
+        assert_eq!(assign(&[ai(1), ai(2)], &ready, &none, 5, 1, true), vec![(1, "phone".into(), Slot::Session(1))]);
+        assert_eq!(assign(&[ai(1), ai(2)], &ready, &none, 5, 0, true), vec![(1, "phone".into(), Slot::Whole)]);
+        // The parallel limit still counts every session.
+        assert_eq!(assign(&[ai(1), ai(2)], &ready, &none, 1, 2, true).len(), 1);
+    }
+
+    #[test]
+    fn physical_phones_come_before_emulators_and_emulators_get_no_sessions() {
+        let ready = vec!["emulator-5554".to_string(), "phone".to_string()];
+        let none = HashMap::new();
+        assert_eq!(
+            assign(&[ai(1), ai(2), ai(3)], &ready, &none, 5, 2, true),
+            vec![(1, "phone".into(), Slot::Session(1)), (2, "phone".into(), Slot::Session(2)), (3, "emulator-5554".into(), Slot::Whole)]
+        );
+        assert_eq!(assign(&[script(1)], &ready, &none, 5, 2, true), vec![(1, "phone".into(), Slot::Whole)]);
+        assert_eq!(assign(&[script(1)], &ready, &none, 5, 2, false), vec![(1, "emulator-5554".into(), Slot::Whole)]);
+    }
+
     #[test]
     fn assign_skips_leased_devices_and_respects_slots() {
         let ready = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let leased: HashMap<String, Lease> = [lease("a", 9)].into();
         let any = |ids: &[u32]| ids.iter().map(|i| (*i, Vec::new())).collect::<Vec<_>>();
-        assert_eq!(assign(&any(&[1, 2, 3]), &ready, &leased, 5), vec![(1, "b".into()), (2, "c".into())]);
-        assert_eq!(assign(&any(&[1, 2, 3]), &ready, &leased, 1), vec![(1, "b".into())]);
-        assert!(assign(&any(&[1]), &ready, &leased, 0).is_empty());
+        assert_eq!(plain(&any(&[1, 2, 3]), &ready, &leased, 5), vec![(1, "b".into()), (2, "c".into())]);
+        assert_eq!(plain(&any(&[1, 2, 3]), &ready, &leased, 1), vec![(1, "b".into())]);
+        assert!(plain(&any(&[1]), &ready, &leased, 0).is_empty());
     }
 
     #[test]
@@ -809,14 +1053,14 @@ mod tests {
         // Two jobs pinned to "b": the first takes it, the second waits; the unpinned job
         // behind them is not held up and takes "a".
         assert_eq!(
-            assign(&[(1, on("b")), (2, on("b")), (3, vec![])], &ready, &none, 5),
+            plain(&[(1, on("b")), (2, on("b")), (3, vec![])], &ready, &none, 5),
             vec![(1, "b".into()), (3, "a".into())]
         );
         // A job pinned to a device that is busy or absent waits; others still start.
         let leased: HashMap<String, Lease> = [lease("a", 9)].into();
-        assert_eq!(assign(&[(1, on("a")), (2, on("zz")), (3, vec![])], &ready, &leased, 5), vec![(3, "b".into())]);
+        assert_eq!(plain(&[(1, on("a")), (2, on("zz")), (3, vec![])], &ready, &leased, 5), vec![(3, "b".into())]);
         // One job per device ("run on every phone") runs on both at once.
-        assert_eq!(assign(&[(1, on("a")), (2, on("b"))], &ready, &none, 2), vec![(1, "a".into()), (2, "b".into())]);
+        assert_eq!(plain(&[(1, on("a")), (2, on("b"))], &ready, &none, 2), vec![(1, "a".into()), (2, "b".into())]);
     }
 
     #[test]
@@ -852,6 +1096,7 @@ mod tests {
             timeout: Duration::from_secs(timeout),
             devices: Arc::new(move || devices.clone()),
             agent: None,
+            sessions: SessionSettings::default(),
         }
     }
 

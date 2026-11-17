@@ -88,7 +88,7 @@ export function SettingsPage() {
               <Field label="Evidence folder" hint="Where runs save screenshots, videos and reports">
                 <input className={INPUT} value={config.artifactsDir} onChange={(e) => set("artifactsDir", e.target.value)} />
               </Field>
-              <Field label="Phones in parallel">
+              <Field label="Tests in parallel" hint="Across all devices; each hidden session counts as one">
                 <input
                   className={INPUT}
                   type="number"
@@ -96,6 +96,30 @@ export function SettingsPage() {
                   value={config.maxParallel}
                   onChange={(e) => set("maxParallel", Number(e.target.value) || 1)}
                 />
+              </Field>
+              <Field
+                label="AI tests per phone"
+                hint="Hidden sessions run on their own display, so the phone's screen stays free. Scripted test sets always use the whole phone."
+              >
+                <select
+                  className={INPUT}
+                  value={config.phoneSessions}
+                  onChange={(e) => set("phoneSessions", Number(e.target.value))}
+                >
+                  <option value={0}>1, on the phone's screen</option>
+                  <option value={1}>1, hidden</option>
+                  <option value={2}>2, hidden</option>
+                </select>
+              </Field>
+              <Field label="Device order">
+                <label className="flex h-9 items-center gap-2 text-sm text-zinc-300">
+                  <input
+                    type="checkbox"
+                    checked={config.physicalFirst}
+                    onChange={(e) => set("physicalFirst", e.target.checked)}
+                  />
+                  Physical phones before emulators
+                </label>
               </Field>
               <Field label="Job timeout (seconds)">
                 <input
