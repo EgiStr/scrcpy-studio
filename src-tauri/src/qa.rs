@@ -907,6 +907,12 @@ impl QaEngine {
     pub fn frame(&self, adb: &Path, id: u32) -> Result<String> {
         let (serial, surface) = {
             let inner = self.inner.lock().unwrap();
+            // A web job has no display: its worker keeps live.jpg, the page it is driving, in its evidence folder.
+            if let Some(job) = inner.jobs.iter().find(|j| j.id == id && j.kind == "web") {
+                let dir = job.evidence_dir.clone().unwrap_or_default();
+                let bytes = std::fs::read(Path::new(&dir).join("live.jpg")).map_err(|_| AppError::NotFound(format!("a live view of job {id} yet")))?;
+                return Ok(format!("data:image/jpeg;base64,{}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)));
+            }
             let s = inner.sessions.get(&id).ok_or_else(|| AppError::NotFound(format!("a hidden display for job {id}")))?;
             (s.serial.clone(), s.surface.clone())
         };

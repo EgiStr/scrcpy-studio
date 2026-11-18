@@ -69,7 +69,7 @@ export function TestPage({ onDevices, onSettings }: { onDevices: () => void; onS
               (ready.length === 0 ? "border-amber-500/40 text-amber-300" : "border-zinc-700 text-zinc-300")
             }
           >
-            {ready.length === 0 ? "No phone connected" : `${ready.length} ${ready.length === 1 ? "phone" : "phones"} · ${free} free`}
+            {ready.length === 0 ? "No phone connected (web tests still run)" : `${ready.length} ${ready.length === 1 ? "phone" : "phones"} · ${free} free`}
           </button>
         </header>
 
@@ -93,7 +93,7 @@ export function TestPage({ onDevices, onSettings }: { onDevices: () => void; onS
           )}
           {ready.length === 0 && (
             <p className="mt-3 flex flex-wrap items-center gap-2 text-xs text-amber-300">
-              Runs wait in the queue until a phone is connected.
+              Phone runs wait in the queue until a phone is connected. Web test sets need no phone.
               <Button variant="ghost" onClick={onDevices}>
                 Connect a phone
               </Button>

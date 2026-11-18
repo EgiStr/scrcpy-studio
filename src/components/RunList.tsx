@@ -43,7 +43,9 @@ function JobRow({ job, onError }: { job: QaJob; onError: (e: string) => void }) 
           {job.scenario}
         </span>
         <span className="font-mono text-xs text-zinc-500">
-          {job.serial
+          {job.kind === "web"
+            ? "web · veronika.telkomsel.com"
+            : job.serial
             ? `${job.serial}${job.display != null ? ` · hidden display ${job.display}` : ""}`
             : job.devices?.length
               ? `waiting for ${job.devices.join(" or ")}`
@@ -69,7 +71,7 @@ function JobRow({ job, onError }: { job: QaJob; onError: (e: string) => void }) 
         </span>
       </div>
       {job.note && job.status !== "passed" && <p className="mt-1 text-xs text-zinc-500">{job.note}</p>}
-      {(watch || job.display != null) && (
+      {(watch || job.display != null || (job.kind === "web" && job.status === "running")) && (
         <div className="mt-2 flex gap-3">
           <SessionScreen job={job} onError={onError} />
           {watch && (

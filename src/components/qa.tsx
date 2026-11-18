@@ -29,32 +29,33 @@ export function since(secs?: number | null, until?: number | null) {
   return `${Math.floor(d / 60)}m ${String(d % 60).padStart(2, "0")}s`;
 }
 
-/** A running job's hidden display: a screenshot every few seconds, and a view-only window on demand. */
+/** A running job's hidden display (or, for a web job, the page its browser is driving): a screenshot every few seconds. */
 export function SessionScreen({ job, onError }: { job: QaJob; onError: (e: string) => void }) {
   const [shot, setShot] = useState<string>();
-  const live = job.status === "running" && job.display != null;
-  usePoll(async () => setShot(await qaFrame(job.id)), 2500, live, [job.id]);
+  const web = job.kind === "web";
+  const live = job.status === "running" && (job.display != null || web);
+  usePoll(async () => setShot(await qaFrame(job.id)), web ? 1500 : 2500, live, [job.id]);
   if (!live) return null;
   return (
-    <div className="flex w-28 shrink-0 flex-col gap-1">
-      <div className="flex aspect-[9/20] items-center justify-center overflow-hidden rounded bg-black">
+    <div className={"flex shrink-0 flex-col gap-1 " + (web ? "w-56" : "w-28")}>
+      <div className={"flex items-center justify-center overflow-hidden rounded bg-black " + (web ? "aspect-[13/20]" : "aspect-[9/20]")}>
         {shot ? (
-          <img src={shot} alt={`hidden display ${job.display} of J${job.id}`} className="h-full w-full object-contain" />
+          <img src={shot} alt={web ? `web page of J${job.id}` : `hidden display ${job.display} of J${job.id}`} className="h-full w-full object-contain" />
         ) : (
           <span className="text-[10px] text-zinc-500">loading…</span>
         )}
       </div>
       <span className="font-mono text-[10px] text-zinc-500">
-        J{job.id} · display {job.display}
+        {web ? `J${job.id} · web page (live)` : `J${job.id} · display ${job.display}`}
       </span>
-      <button
+      {!web && <button
         type="button"
         title="Open a window on this hidden display (view only; closing it leaves the test running)"
         onClick={() => qaWatch(job.id).catch((e) => onError(errMessage(e)))}
         className="rounded border border-zinc-700 px-2 py-0.5 text-[11px] text-zinc-300 hover:bg-zinc-800"
       >
         Watch
-      </button>
+      </button>}
     </div>
   );
 }

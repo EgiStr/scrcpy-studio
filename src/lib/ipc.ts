@@ -151,7 +151,7 @@ export interface QaJob {
   scenario: string;
   testset: string;
   only?: string | null;
-  kind: "script" | "agent";
+  kind: "script" | "agent" | "web";
   goal?: PlanItem | null;
   devices: string[];
   actions: number;

@@ -9,6 +9,9 @@ const isSaved = (path: string) => /[\\/]scenarios[\\/]/.test(path);
 
 const fileName = (path: string) => path.split(/[\\/]/).pop() ?? path;
 
+// Test sets for the standalone web page run in Chrome sessions, with no phone (see qa.rs `is_standalone`).
+const isWeb = (path: string) => /bomb-web|standalone/i.test(fileName(path));
+
 export function TestsetPicker({
   target,
   onQueued,
@@ -22,6 +25,7 @@ export function TestsetPicker({
   const [picked, setPicked] = useState<Record<string, boolean>>({});
   const [only, setOnly] = useState<Record<string, string>>({});
   const [filter, setFilter] = useState("");
+  const [webOnly, setWebOnly] = useState(false);
   const [error, setError] = useState<string>();
 
   useEffect(() => {
@@ -59,7 +63,9 @@ export function TestsetPicker({
     );
   }
 
-  const shown = testsets.filter((t) => fileName(t).toLowerCase().includes(filter.trim().toLowerCase()));
+  const shown = testsets.filter(
+    (t) => fileName(t).toLowerCase().includes(filter.trim().toLowerCase()) && (!webOnly || isWeb(t)),
+  );
   const pickedCount = testsets.filter((t) => picked[t]).length;
 
   return (
@@ -71,6 +77,18 @@ export function TestsetPicker({
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
         />
+        <button
+          type="button"
+          aria-pressed={webOnly}
+          title="Test sets for veronika.telkomsel.com: parallel Chrome sessions, no phone needed"
+          onClick={() => setWebOnly(!webOnly)}
+          className={
+            "rounded-full border px-3 py-1 text-xs transition-colors " +
+            (webOnly ? "border-sky-500/60 bg-sky-600/15 text-sky-300" : "border-zinc-700 text-zinc-300 hover:bg-zinc-800")
+          }
+        >
+          Web (no phone)
+        </button>
         <Button variant="primary" disabled={pickedCount === 0} onClick={submit}>
           Run {pickedCount || ""} selected
         </Button>
@@ -84,6 +102,7 @@ export function TestsetPicker({
               <span className="truncate" title={t}>
                 {fileName(t)}
               </span>
+              {isWeb(t) && <span className="shrink-0 rounded bg-sky-500/20 px-1 text-[10px] text-sky-300">web</span>}
               {isSaved(t) && <span className="shrink-0 rounded bg-sky-500/20 px-1 text-[10px] text-sky-300">AI scenario</span>}
             </label>
             {picked[t] && (
@@ -99,7 +118,8 @@ export function TestsetPicker({
       </div>
       <p className="mt-2 text-xs text-zinc-500">
         Each test set runs as one job on its own phone, in parallel when several phones are free. Phones that share one
-        MyTelkomsel account can interfere with each other.
+        MyTelkomsel account can interfere with each other. Web test sets need no phone: they start at once in parallel
+        Chrome sessions, and the Runs list shows the live page.
       </p>
     </div>
   );
