@@ -16,6 +16,7 @@ import {
   type PlanItem,
   type QaScenario,
   type ScenarioCase,
+  type ScenarioSource,
 } from "../lib/ipc";
 import { remember, remembered } from "../lib/remember";
 import { Button, Tabs } from "./ui";
@@ -28,6 +29,29 @@ type Mode = "scenario" | "agent";
 
 const fileName = (path: string) => path.split(/[\\/]/).pop() ?? path;
 
+// What the scenario writer produces. The bomb sources write load tests (rate, length, daily) for the web page
+// (parallel anonymous Chrome sessions, no phone) or for the phone.
+const SOURCES: { id: ScenarioSource; label: string; hint: string; example: string }[] = [
+  {
+    id: "scripted",
+    label: "HP · pertanyaan",
+    hint: "Questions typed into the MyTelkomsel app on a phone, graded by keypoints.",
+    example: "Check that search finds 10 GB internet packages with their price, and that Veronika explains roaming packages for Japan.",
+  },
+  {
+    id: "bomb-web",
+    label: "Bomb test · Web",
+    hint: "Load test of veronika.telkomsel.com in parallel Chrome sessions. Anonymous: no number, no OTP, no SMS. Needs no phone.",
+    example: "Bomb test Veronika web: 100 chat per menit selama 1 menit, lalu panjang chat 100 sampai 8000 karakter, lalu 1000 chat dalam sehari.",
+  },
+  {
+    id: "bomb-phone",
+    label: "Bomb test · HP",
+    hint: "Load test through the MyTelkomsel app on a phone. Slow (one chat at a time); can also only type and count characters.",
+    example: "Bomb test Veronika di HP: panjang chat 100 sampai 8000 karakter tanpa mengirim, lalu 30 chat per menit selama 2 menit.",
+  },
+];
+
 function title(it: PlanItem) {
   if (it.kind === "testset") return `${fileName(it.testset ?? "")}${it.only ? ` · ${it.only}` : " · all cases"}`;
   return `${it.id} · ${it.topic ?? ""}`;
@@ -38,6 +62,13 @@ export function AiPlanner({ target, onQueued }: { target: Target; onQueued: (run
   useEffect(() => {
     remember("planner.mode", mode);
   }, [mode]);
+  const [source, setSource] = useState<ScenarioSource>(() =>
+    remembered("planner.source", ["scripted", "bomb-web", "bomb-phone"] as ScenarioSource[], "scripted"),
+  );
+  useEffect(() => {
+    remember("planner.source", source);
+  }, [source]);
+  const src = SOURCES.find((s) => s.id === source) ?? SOURCES[0];
   const [objective, setObjective] = useState("");
   const [plan, setPlan] = useState<Plan>();
   const [keep, setKeep] = useState<boolean[]>([]);
@@ -56,7 +87,7 @@ export function AiPlanner({ target, onQueued }: { target: Target; onQueued: (run
         setPlan(p);
         setKeep(p.items.map(() => true));
       } else {
-        const d = await aiScenario(objective);
+        const d = await aiScenario(objective, source);
         setYaml(d.yaml);
         setCost(d.costUsd);
         setCases(undefined);
@@ -156,10 +187,19 @@ export function AiPlanner({ target, onQueued }: { target: Target; onQueued: (run
             ))}
           </ul>
         )}
-        <p className="mt-2 text-xs text-zinc-500">
-          Checked with the QA skill's own loader. Only read-only surfaces (Veronika, search, home) with ASCII questions
-          are allowed; the runner taps nothing that buys, pays or sends. Saved scenarios also appear in Pick test sets.
-        </p>
+        {source === "scripted" ? (
+          <p className="mt-2 text-xs text-zinc-500">
+            Checked with the QA skill's own loader. Only read-only surfaces (Veronika, search, home) with ASCII questions
+            are allowed; the runner taps nothing that buys, pays or sends. Saved scenarios also appear in Pick test sets.
+          </p>
+        ) : (
+          <p className="mt-2 text-xs text-amber-300">
+            Bomb test: these chats are real traffic on production, at the volumes written above. Check the rates and
+            totals before you run it. {source === "bomb-web"
+              ? "It is anonymous (no number, no OTP) and needs no phone."
+              : "It needs a connected phone."} A file named STOP in the run folder ends it.
+          </p>
+        )}
       </div>
     );
   }
@@ -252,9 +292,32 @@ export function AiPlanner({ target, onQueued }: { target: Target; onQueued: (run
             : "The AI picks existing test sets and drives the phone itself for anything new."}
         </span>
       </div>
+      {mode === "scenario" && (
+        <div className="mb-2 flex flex-wrap items-center gap-2">
+          <span className="text-xs text-zinc-500">Write for</span>
+          {SOURCES.map((s) => (
+            <button
+              key={s.id}
+              type="button"
+              aria-pressed={source === s.id}
+              title={s.hint}
+              onClick={() => setSource(s.id)}
+              className={
+                "rounded-full border px-3 py-1 text-xs transition-colors " +
+                (source === s.id
+                  ? "border-emerald-500/60 bg-emerald-600/15 text-emerald-300"
+                  : "border-zinc-700 text-zinc-300 hover:bg-zinc-800")
+              }
+            >
+              {s.label}
+            </button>
+          ))}
+          <span className="text-xs text-zinc-500">{src.hint}</span>
+        </div>
+      )}
       <textarea
         className={INPUT + " h-24 w-full resize-y"}
-        placeholder="Example: Check that search finds 10 GB internet packages with their price, and that Veronika explains roaming packages for Japan."
+        placeholder={`Example: ${mode === "scenario" ? src.example : SOURCES[0].example}`}
         value={objective}
         onChange={(e) => setObjective(e.target.value)}
         onKeyDown={(e) => {

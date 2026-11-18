@@ -49,6 +49,59 @@ pub struct Checked {
     pub cases: Vec<CaseInfo>,
 }
 
+/// What the model writes: a scripted read-only test set, or a Veronika bomb test set for the
+/// standalone web page or for the phone (see the skill's `veronika-bomb*.yaml`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Scripted,
+    BombWeb,
+    BombPhone,
+}
+
+impl Source {
+    pub fn parse(s: Option<&str>) -> Source {
+        match s {
+            Some("bomb-web") => Source::BombWeb,
+            Some("bomb-phone") => Source::BombPhone,
+            _ => Source::Scripted,
+        }
+    }
+}
+
+/// The best practices of the skill's bomb runners (docs/research/veronika-bomb-test.md), as rules for the writer.
+fn bomb_prompt(objective: &str, source: Source) -> String {
+    let (where_, shape) = if source == Source::BombWeb {
+        (
+            "the standalone Veronika web page (https://veronika.telkomsel.com/veronika), run by scripts in skills/veronika-standalone in parallel Chrome sessions, anonymous",
+            "Start from testsets/veronika-bomb-web.yaml. Keep its `standalone:` block with ONLY `url:` (never msisdn, otp or any number: no chat may make Veronika send an SMS) and its `web:` block (sessions, timeout, settle). The page's chat box holds 2000 characters.",
+        )
+    } else {
+        (
+            "the MyTelkomsel app on a phone, run by scripts/bomb_ui.py through the real chat field",
+            "Start from testsets/veronika-bomb.yaml (phone chats are SENT) or testsets/veronika-bomb-field.yaml (`phone: {no_send: true}`: types and counts characters, sends nothing). Keep the `phone:` block. Never write an `api:` block.",
+        )
+    };
+    format!(
+        r#"You write a Veronika BOMB TEST set (load and limit test) for {where_}. The current directory is the mytelkomsel-qa skill. Read scripts/_bomb.py (the schema: kinds rate, length, daily) and the example test set named below, and copy their style.
+
+{shape}
+
+Best practices (follow them, and say in a YAML comment why each test exists):
+- Cover what the objective asks, in the three kinds: `rate` (rate chats every per seconds, for duration seconds), `length` (one chat per entry of lengths) and `daily` (total chats as fast as rate/per allow).
+- Escalate: begin with a small smoke test (about 5 to 10 chats) so a broken setup shows before the heavy test, then raise the rate in steps (for example 10, 50, 100 per minute) so the first sign of a limit shows between two steps, not only at the top.
+- Open workload model: the runners send on a schedule whatever the replies do, so give a real rate and per, never a loop. A chat that finds every session busy counts as dropped.
+- Web only: `web.sessions` must cover rate x typical latency / 60 (latency 10 to 50 s was seen), so 100 chats per minute needs 24 sessions or more.
+- Length tests: include values below, at and above the limit (100, 200, 500, 1000, 2000, 4000, 8000).
+- Put `cooldown: 120` (seconds) so a rate limit hit by one test does not spill into the next.
+- Test ids are unique and short (RATE-1, LEN-1, DAY-1 ...). No secrets, tokens or numbers in the file.
+- These chats go to PRODUCTION and are real traffic: use the volumes the objective states, never more.
+
+Answer with the YAML only, in one ```yaml fence, starting with name: and a comment line saying what it measures.
+
+Objective: {objective}"#
+    )
+}
+
 fn draft_prompt(objective: &str) -> String {
     format!(
         r#"You write QA test sets for the MyTelkomsel Android app. Turn the objective below into ONE new test set that the skill's runner (scripts/run.py) runs without a model.
@@ -90,14 +143,15 @@ fn yaml_name(yaml: &str) -> Option<String> {
 }
 
 /// Ask the model for a test set. Read-only: it may look at the skill and nothing else.
-pub fn draft(cfg: &AgentConfig, objective: &str) -> Result<Draft> {
+pub fn draft(cfg: &AgentConfig, objective: &str, source: Source) -> Result<Draft> {
     let objective = objective.trim();
     if objective.is_empty() {
         return Err(AppError::InvalidArgs("write an objective first".into()));
     }
+    let prompt = if source == Source::Scripted { draft_prompt(objective) } else { bomb_prompt(objective, source) };
     let mut cmd = crate::agent::base_command(&cfg.command);
     cmd.arg("-p")
-        .arg(draft_prompt(objective))
+        .arg(prompt)
         .args(["--model", &cfg.model, "--output-format", "json"])
         .args(["--allowedTools", "Read,Glob,Grep"])
         .args(["--disallowedTools", "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch"])
@@ -137,9 +191,9 @@ print(json.dumps({"name": t["name"], "cases": [{"id": c["id"], "surface": c["sur
 "#;
 
 /// Load a test set file with the skill's own loader (`scripts/_testset.py`).
-fn load_with_skill(python: &Path, skill_root: &Path, file: &Path) -> Result<Checked> {
+fn load_with_skill(python: &Path, skill_root: &Path, file: &Path, bomb: bool) -> Result<Checked> {
     let mut cmd = std::process::Command::new(python);
-    cmd.arg("-c").arg(LOADER).arg(skill_root.join("scripts")).arg(file).stdin(Stdio::null());
+    cmd.arg("-c").arg(if bomb { BOMB_LOADER } else { LOADER }).arg(skill_root.join("scripts")).arg(file).stdin(Stdio::null());
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
     let out = cmd.output().map_err(|e| AppError::NotFound(format!("python \"{}\" ({e})", python.display())))?;
@@ -151,6 +205,53 @@ fn load_with_skill(python: &Path, skill_root: &Path, file: &Path) -> Result<Chec
     }
     let cases: Vec<CaseInfo> = serde_json::from_value(v["cases"].clone()).map_err(|e| AppError::Io(e.to_string()))?;
     Ok(Checked { name: v["name"].as_str().unwrap_or_default().to_string(), cases })
+}
+
+/// A bomb test set has `tests:` (rate, length, daily); a scripted one has `cases:`.
+fn is_bomb_yaml(yaml: &str) -> bool {
+    yaml.lines().any(|l| l.starts_with("tests:"))
+}
+
+const BOMB_LOADER: &str = r#"
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import _bomb
+try:
+    t = _bomb.load(sys.argv[2])
+except Exception as e:
+    print(json.dumps({"error": str(e)})); sys.exit(0)
+def what(x):
+    n = _bomb.count(x)
+    if x["kind"] == "length": return f"{n} chats, lengths {x['lengths']}"
+    if x["kind"] == "daily": return f"{n} chats at {x['rate']} per {x['per']} s"
+    return f"{n} chats: {x['rate']} per {x['per']} s for {x['duration']} s"
+print(json.dumps({"name": t.get("name", ""), "cases": [{"id": x["id"], "surface": x["kind"], "question": what(x), "topic": x["kind"]} for x in t["tests"]]}))
+"#;
+
+/// The app's rules for an AI-written bomb set. It may only describe load on Veronika: web sets stay anonymous
+/// (no number, no OTP, so no SMS is sent), and credentials never go in the file (the API runner is the developer's).
+pub fn bomb_rules(yaml: &str, c: &Checked) -> std::result::Result<(), String> {
+    if c.cases.is_empty() {
+        return Err("the bomb test has no tests".into());
+    }
+    let web = yaml.lines().any(|l| l.starts_with("standalone:"));
+    let phone = yaml.lines().any(|l| l.starts_with("phone:"));
+    if web == phone {
+        return Err("a bomb test needs exactly one of a `standalone:` block (web) or a `phone:` block".into());
+    }
+    if yaml.lines().any(|l| l.starts_with("api:")) {
+        return Err("an AI-written bomb test cannot have an `api:` block (it would carry an endpoint and a token)".into());
+    }
+    let low = yaml.to_ascii_lowercase();
+    if web {
+        if low.contains("msisdn") || low.lines().any(|l| l.trim_start().starts_with("otp")) {
+            return Err("a web bomb test is anonymous: no msisdn and no otp (Veronika would send an SMS)".into());
+        }
+        if !low.contains("veronika.telkomsel.com") {
+            return Err("a web bomb test must target https://veronika.telkomsel.com/veronika".into());
+        }
+    }
+    Ok(())
 }
 
 /// The app's own rules on top of the skill's schema: read-only surfaces and ASCII
@@ -195,10 +296,15 @@ pub fn check(python: &Path, skill_root: &Path, data_dir: &Path, yaml: &str) -> R
     std::fs::create_dir_all(&tmp)?;
     let file = tmp.join(format!("check-{}.yaml", std::process::id()));
     std::fs::write(&file, yaml)?;
-    let checked = load_with_skill(python, skill_root, &file);
+    let bomb = is_bomb_yaml(yaml);
+    let checked = load_with_skill(python, skill_root, &file, bomb);
     let _ = std::fs::remove_file(&file);
     let checked = checked?;
-    rules(&checked).map_err(AppError::InvalidArgs)?;
+    if bomb {
+        bomb_rules(yaml, &checked).map_err(AppError::InvalidArgs)?;
+    } else {
+        rules(&checked).map_err(AppError::InvalidArgs)?;
+    }
     Ok(checked)
 }
 
@@ -263,6 +369,31 @@ mod tests {
         let mut taps = case("A", "veronika", "halo");
         taps.steps = 2;
         assert!(ok(vec![taps]).is_err());
+    }
+
+    #[test]
+    fn bomb_sets_stay_anonymous_and_credential_free() {
+        let c = |id: &str| Checked { name: "b".into(), cases: vec![case(id, "rate", "100 chats")] };
+        let web = "name: b\nstandalone:\n  url: https://veronika.telkomsel.com/veronika\nweb:\n  sessions: 24\ntests:\n  - id: R\n";
+        assert!(is_bomb_yaml(web) && !is_bomb_yaml("name: x\ncases:\n"));
+        assert!(bomb_rules(web, &c("R")).is_ok());
+        assert!(bomb_rules(&web.replace("url:", "msisdn: \"0813\"\n  url:"), &c("R")).unwrap_err().contains("anonymous"));
+        assert!(bomb_rules(&web.replace("sessions", "otp: 1\n  sessions"), &c("R")).unwrap_err().contains("anonymous"));
+        assert!(bomb_rules(&web.replace("veronika.telkomsel.com", "example.com"), &c("R")).unwrap_err().contains("veronika.telkomsel.com"));
+        assert!(bomb_rules(&format!("{web}api:\n  url: x\n"), &c("R")).unwrap_err().contains("api"));
+        assert!(bomb_rules("name: b\nphone:\n  no_send: true\ntests:\n", &c("L")).is_ok());
+        assert!(bomb_rules("name: b\ntests:\n", &c("L")).unwrap_err().contains("exactly one"));
+        assert!(bomb_rules(web, &Checked { name: "b".into(), cases: vec![] }).is_err());
+    }
+
+    #[test]
+    fn the_source_picks_the_prompt() {
+        assert_eq!(Source::parse(Some("bomb-web")), Source::BombWeb);
+        assert_eq!(Source::parse(Some("bomb-phone")), Source::BombPhone);
+        assert_eq!(Source::parse(None), Source::Scripted);
+        let web = bomb_prompt("100 chats a minute", Source::BombWeb);
+        assert!(web.contains("veronika.telkomsel.com") && web.contains("smoke test") && web.contains("100 chats a minute"));
+        assert!(bomb_prompt("x", Source::BombPhone).contains("bomb_ui.py"));
     }
 
     /// Runs the real skill loader: `cargo test --lib scenario -- --ignored` with the skill checkout.

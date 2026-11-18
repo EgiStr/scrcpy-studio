@@ -302,7 +302,10 @@ export interface ScenarioCase {
   question: string;
   topic: string;
 }
-export const aiScenario = (objective: string) => invoke<ScenarioDraft>("ai_scenario", { objective });
+/** What the AI writes: a scripted phone test set, or a bomb test for the web page or the phone. */
+export type ScenarioSource = "scripted" | "bomb-web" | "bomb-phone";
+export const aiScenario = (objective: string, source: ScenarioSource = "scripted") =>
+  invoke<ScenarioDraft>("ai_scenario", { objective, source });
 export const qaScenarioCheck = (yaml: string) =>
   invoke<{ name: string; cases: ScenarioCase[] }>("qa_scenario_check", { yaml });
 export const qaScenarioSave = (yaml: string) => invoke<string>("qa_scenario_save", { yaml });

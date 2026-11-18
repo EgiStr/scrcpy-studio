@@ -653,10 +653,10 @@ pub fn ai_plan(state: State<AppState>, objective: String) -> Result<crate::agent
 /// Scenario mode: the AI writes a test set (YAML) for `run.py`. Nothing is saved or run
 /// until the tester reviews it.
 #[tauri::command(async)]
-pub fn ai_scenario(state: State<AppState>, objective: String) -> Result<crate::scenario::Draft> {
+pub fn ai_scenario(state: State<AppState>, objective: String, source: Option<String>) -> Result<crate::scenario::Draft> {
     let cfg = QaConfig::load(&state.data_dir).agent()?;
-    let draft = crate::scenario::draft(&cfg, &objective)?;
-    let detail = serde_json::json!({ "objective": objective, "model": cfg.model, "costUsd": draft.cost_usd, "name": draft.name });
+    let draft = crate::scenario::draft(&cfg, &objective, crate::scenario::Source::parse(source.as_deref()))?;
+    let detail = serde_json::json!({ "objective": objective, "source": source, "model": cfg.model, "costUsd": draft.cost_usd, "name": draft.name });
     state.qa.audit("scenario-draft", None, &detail.to_string());
     Ok(draft)
 }
