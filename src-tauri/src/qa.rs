@@ -480,6 +480,42 @@ fn scenario_label(s: &Scenario) -> String {
     }
 }
 
+/// A Veronika bomb test set (its tests have `kind: rate | length | daily`), run by the skill's
+/// `bomb_ui.py` instead of `run.py`. `run.py --list` refuses it, so it is one Veronika job.
+fn is_bomb(testset: &str) -> bool {
+    std::fs::read_to_string(testset).is_ok_and(|t| {
+        t.lines().any(|l| {
+            let l = l.trim_start().trim_start_matches("- ").trim();
+            matches!(l.strip_prefix("kind:").map(str::trim), Some("rate" | "length" | "daily"))
+        })
+    })
+}
+
+/// A Veronika standalone (web) test set: it has a top-level `standalone:` block. It needs no phone.
+fn is_standalone(testset: &str) -> bool {
+    std::fs::read_to_string(testset).is_ok_and(|t| t.lines().any(|l| l.starts_with("standalone:")))
+}
+
+/// The worker's arguments before the test set: `run.py`, its sibling `bomb_ui.py` for a bomb test set,
+/// or the veronika-standalone skill's `standalone.py` for a web test set.
+fn worker_args(args: &[String], testset: &str) -> Vec<String> {
+    let mut out = args.to_vec();
+    if let Some(first) = out.first_mut() {
+        let run_py = Path::new(first.as_str());
+        let bomb = run_py.with_file_name("bomb_ui.py");
+        // run.py is skills/mytelkomsel-qa/scripts/run.py; the web skill sits beside mytelkomsel-qa.
+        // A web bomb test set (no number, no OTP) has its own runner; any other web set logs in and asks questions.
+        let script = if is_bomb(testset) { "bomb_web.py" } else { "standalone.py" };
+        let web = run_py.parent().and_then(Path::parent).and_then(Path::parent).map(|s| s.join("veronika-standalone").join("scripts").join(script));
+        if is_standalone(testset) && web.as_ref().is_some_and(|w| w.is_file()) {
+            *first = web.unwrap().to_string_lossy().to_string();
+        } else if is_bomb(testset) && bomb.is_file() {
+            *first = bomb.to_string_lossy().to_string();
+        }
+    }
+    out
+}
+
 /// `run.py` exits 1 for "some failed or errored". Its run.json says which: a run whose
 /// cases only errored never reached a product verdict, so it is an ERROR, not a FAIL.
 fn refine(status: Status, evidence_dir: &Path) -> Status {
@@ -809,7 +845,14 @@ impl QaEngine {
                     scenario: p.label,
                     testset: s.testset.clone(),
                     only: p.only,
-                    kind: if s.goal.is_some() { "agent" } else { "script" }.into(),
+                    kind: if s.goal.is_some() {
+                        "agent"
+                    } else if is_standalone(&s.testset) {
+                        "web"
+                    } else {
+                        "script"
+                    }
+                    .into(),
                     goal: s.goal.clone(),
                     devices: s.devices.clone(),
                     actions: 0,
@@ -949,6 +992,17 @@ impl QaEngine {
                 return false;
             };
             reap(&mut inner, &settings);
+            // A web job (Veronika standalone) needs no phone: start it whenever a worker slot is free.
+            let web: Vec<u32> = inner.jobs.iter().filter(|j| j.status == Status::Queued && j.kind == "web").map(|j| j.id).collect();
+            for id in web {
+                if inner.children.len() >= settings.max_parallel {
+                    break;
+                }
+                let place = Place { phone: format!("web-{id}"), serial: "web".into(), slot: Slot::Whole };
+                let key = lease_key(&place.phone, place.slot);
+                start(&mut inner, &settings, id, place, None);
+                inner.leases.remove(&key); // no device to hold, and a lease on "web" would look like an unplugged phone
+            }
             let queued = inner.jobs.iter().any(|j| j.status == Status::Queued);
             if !queued && inner.children.is_empty() {
                 inner.scheduling = false;
@@ -969,7 +1023,7 @@ impl QaEngine {
         let queued: Vec<Want> = inner
             .jobs
             .iter()
-            .filter(|j| j.status == Status::Queued)
+            .filter(|j| j.status == Status::Queued && j.kind != "web")
             .map(|j| Want { id: j.id, allowed: j.devices.clone(), session: j.goal.is_some() || settings.sessions.scripts, veronika: j.veronika, mode: j.mode })
             .collect();
         let slots = settings.max_parallel.saturating_sub(inner.children.len());
@@ -1191,7 +1245,7 @@ fn start(inner: &mut Inner, settings: &Settings, id: u32, place: Place, display:
             }
             None => {
                 let mut cmd = Command::new(&r.program);
-                cmd.args(&r.args).arg(&testset).arg("--out").arg(&dir).args(["-s", &serial]);
+                cmd.args(worker_args(&r.args, &testset)).arg(&testset).arg("--out").arg(&dir).args(["-s", &serial]);
                 if let Some(only) = &only {
                     cmd.args(["--only", only]);
                 }
@@ -1567,6 +1621,63 @@ mod tests {
             assert!(s.jobs.iter().filter(|j| j.status == Status::Running).count() <= 1, "one pinned device, one job at a time");
         });
         assert!(state.jobs.iter().all(|j| j.serial.as_deref() == Some("dev-b") && j.status == Status::Passed));
+    }
+
+    #[test]
+    fn a_bomb_test_set_runs_bomb_ui() {
+        let dir = tempfile::tempdir().unwrap();
+        let scripts = dir.path().join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        let run_py = scripts.join("run.py").to_string_lossy().to_string();
+        std::fs::write(&run_py, "").unwrap();
+        let bomb = dir.path().join("bomb.yaml");
+        std::fs::write(&bomb, "name: b\ntests:\n  - id: LEN-1\n    kind: length\n    lengths: [100]\n").unwrap();
+        let cases = dir.path().join("cases.yaml");
+        std::fs::write(&cases, "cases:\n  - id: VER-T001\n    question: halo\n").unwrap();
+        let (bomb, cases) = (bomb.to_string_lossy().to_string(), cases.to_string_lossy().to_string());
+        // without bomb_ui.py next to run.py, run.py runs everything
+        assert_eq!(worker_args(&[run_py.clone()], &bomb), vec![run_py.clone()]);
+        std::fs::write(scripts.join("bomb_ui.py"), "").unwrap();
+        assert!(worker_args(&[run_py.clone()], &bomb)[0].ends_with("bomb_ui.py"));
+        assert_eq!(worker_args(&[run_py.clone()], &cases), vec![run_py]);
+    }
+
+    #[test]
+    fn a_web_job_runs_with_no_phone_and_leaves_no_lease() {
+        let out = tempfile::tempdir().unwrap();
+        let set = out.path().join("web.yaml");
+        std::fs::write(&set, "name: w\nstandalone:\n  msisdn: \"081\"\ncases: []\n").unwrap();
+        let engine = QaEngine::new();
+        let mut settings = fake(out.path(), &[], 2, 60);
+        settings.runner.args = vec!["-c".into(), "import sys; sys.exit(0)".into()];
+        engine.submit_with(settings, vec![Scenario { testset: set.to_string_lossy().to_string(), ..Default::default() }]).unwrap();
+        let state = wait_done(&engine, |_| {});
+        assert!(state.jobs.iter().all(|j| j.kind == "web" && j.status == Status::Passed), "{:?}", state.jobs.iter().map(|j| (&j.kind, j.status)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_standalone_test_set_runs_the_web_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        let scripts = dir.path().join("mytelkomsel-qa").join("scripts");
+        let web = dir.path().join("veronika-standalone").join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::create_dir_all(&web).unwrap();
+        let run_py = scripts.join("run.py").to_string_lossy().to_string();
+        let set = dir.path().join("web.yaml");
+        std::fs::write(&set, "name: w\nstandalone:\n  msisdn: \"081\"\ncases: []\n").unwrap();
+        let set = set.to_string_lossy().to_string();
+        assert!(is_standalone(&set));
+        // until the skill's standalone.py exists, the worker stays run.py
+        assert_eq!(worker_args(&[run_py.clone()], &set), vec![run_py.clone()]);
+        std::fs::write(web.join("standalone.py"), "").unwrap();
+        assert!(worker_args(&[run_py.clone()], &set)[0].ends_with("standalone.py"));
+        // a web bomb test set (anonymous, no OTP) runs bomb_web.py
+        let bomb = dir.path().join("webbomb.yaml");
+        std::fs::write(&bomb, "name: w\nstandalone:\n  url: x\ntests:\n  - id: R\n    kind: rate\n").unwrap();
+        let bomb = bomb.to_string_lossy().to_string();
+        assert_eq!(worker_args(&[run_py.clone()], &bomb), vec![run_py.clone()]);
+        std::fs::write(web.join("bomb_web.py"), "").unwrap();
+        assert!(worker_args(&[run_py], &bomb)[0].ends_with("bomb_web.py"));
     }
 
     #[test]
